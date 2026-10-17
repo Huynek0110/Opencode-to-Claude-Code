@@ -1,0 +1,36 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "ccbridge": {
+      "mode": "primary",
+      "description": "Raw text completion agent for the Claude Code bridge. Must never touch the machine.",
+      "system": "",
+      "model": "opencode/space-bunny-free",
+      "permissions": [
+        { "action": "read", "resource": "*", "effect": "deny" },
+        { "action": "write", "resource": "*", "effect": "deny" },
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "multiedit", "resource": "*", "effect": "deny" },
+        { "action": "patch", "resource": "*", "effect": "deny" },
+        { "action": "glob", "resource": "*", "effect": "deny" },
+        { "action": "grep", "resource": "*", "effect": "deny" },
+        { "action": "list", "resource": "*", "effect": "deny" },
+        { "action": "bash", "resource": "*", "effect": "deny" },
+        { "action": "shell", "resource": "*", "effect": "deny" },
+        { "action": "bashoutput", "resource": "*", "effect": "deny" },
+        { "action": "bashkill", "resource": "*", "effect": "deny" },
+        { "action": "execute", "resource": "*", "effect": "deny" },
+        { "action": "task", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "webfetch", "resource": "*", "effect": "deny" },
+        { "action": "websearch", "resource": "*", "effect": "deny" },
+        { "action": "skill", "resource": "*", "effect": "deny" },
+        { "action": "question", "resource": "*", "effect": "deny" },
+        { "action": "todowrite", "resource": "*", "effect": "deny" },
+        { "action": "todoread", "resource": "*", "effect": "deny" },
+        { "action": "lsp", "resource": "*", "effect": "deny" },
+        { "action": "external_directory", "resource": "*", "effect": "deny" }
+      ]
+    }
+  }
+}

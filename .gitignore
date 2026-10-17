@@ -1,0 +1,24 @@
+# runtime state - the bridge writes these
+bridge.log
+bridge.log.*
+bridge.mock.log
+bridge.dbg.log
+effort.json
+
+# the shared local opencode password, generated on first start
+.opencode-password
+
+# local scratch
+*.tmp
+scratch/
+tmp/
+
+# node
+node_modules/
+npm-debug.log*
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

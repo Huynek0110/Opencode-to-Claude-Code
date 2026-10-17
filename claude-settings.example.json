@@ -1,0 +1,48 @@
+{
+  "model": "space-bunny-free",
+
+  "modelPicker": {
+    "replaceBuiltInOptions": true,
+    "options": [
+      {
+        "model": "space-bunny-free",
+        "label": "Space Bunny Free (OpenCode bridge)",
+        "description": "Free stealth model, served through opencode serve. Effort: low .. max",
+        "behavesAs": "claude-opus-4-7"
+      }
+    ]
+  },
+
+  "modelSettings": {
+    "space-bunny-free": {
+      "effortLevel": "high",
+      "autoCompactWindow": 450000
+    }
+  },
+
+  "maxEffortLevel": "max",
+  "autoCompactWindow": 450000,
+  "skipWebFetchPreflight": true,
+
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+    "ANTHROPIC_AUTH_TOKEN": "local-bridge-no-auth",
+
+    "ANTHROPIC_DEFAULT_MODEL": "space-bunny-free",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "space-bunny-free",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "space-bunny-free",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "space-bunny-free",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "space-bunny-free",
+
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+    "CLAUDE_CODE_GATEWAY_HINT_HEADERS": "1",
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "450000",
+
+    "MAX_MCP_OUTPUT_TOKENS": "25000",
+    "BASH_DEFAULT_TIMEOUT_MS": "180000",
+    "BASH_MAX_TIMEOUT_MS": "600000"
+  }
+}
