@@ -2008,8 +2008,29 @@ const self = normalizePath(fileURLToPath(import.meta.url));
 const isMain = entry !== "" && entry === self;
 
 if (isMain) {
+  // Record how the process ended. A bridge that disappears with no line in the
+  // log is indistinguishable from one that was never started, and Claude Code
+  // reports the result as ECONNREFUSED with a note about firewalls - which
+  // sends you looking at the wrong thing entirely.
+  const exited = (how, code) => {
+    try {
+      fs.appendFileSync(LOG_FILE, JSON.stringify({ t: new Date().toISOString(), kind: "exit", how, code }) + "\n");
+    } catch {}
+  };
+  process.on("exit", (code) => exited("exit", code));
+  process.on("uncaughtException", (err) => {
+    exited("uncaughtException", String(err && err.message));
+    process.stderr.write(`[bridge] uncaught: ${err && err.stack}\n`);
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (err) => {
+    exited("unhandledRejection", String(err && err.message));
+    process.stderr.write(`[bridge] unhandled rejection: ${err && err.stack}\n`);
+  });
+
   for (const sig of ["SIGINT", "SIGTERM"]) {
     process.on(sig, () => {
+      exited(sig, 0);
       for (const entry2 of sessions.values()) {
         if (entry2.id) ocFetch(`/session/${entry2.id}`, { method: "DELETE" }).catch(() => {});
       }
@@ -2019,6 +2040,7 @@ if (isMain) {
   }
 
   server.listen(PORT, "127.0.0.1", () => {
+    logRequest("startup", { port: PORT, model: MODEL, agent: AGENT, pid: process.pid });
     process.stdout.write(
       `claude-code-bridge listening on http://127.0.0.1:${PORT}\n` +
         `  model   ${MODEL} via opencode serve :${OC_PORT}\n` +

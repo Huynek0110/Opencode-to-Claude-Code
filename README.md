@@ -132,6 +132,15 @@ powershell -ExecutionPolicy Bypass -File ".\run-tests.ps1" -Live -LiveCount effo
 ```
 
 > `claude` **phụ thuộc** bridge. Bridge tắt thì `claude` không chạy được.
+>
+> Khi bridge tắt, Claude Code báo `Connection refused — a firewall or proxy may be blocking
+> it (ECONNREFUSED)`. **Câu đó dẫn sai hướng** — không có firewall nào liên quan; chỉ đơn
+> giản là chưa có gì lắng nghe ở `127.0.0.1:8787`. Dùng `.\claude-bridge.ps1` thay vì gọi
+> `claude` trực tiếp: nó tự bật bridge nếu đang tắt rồi mới mở Claude Code.
+>
+> `bridge.log` ghi cả vòng đời tiến trình (`startup` / `exit`), nên phân biệt được ngay:
+> **có** dòng `exit` = tắt có trật tự hoặi crash (dòng đó ghi cả lý do); **không** có dòng
+> `exit` = bị giết từ bên ngoài — thường là đóng cửa sổ console đã khởi chạy nó.
 
 ---
 
