@@ -52,6 +52,8 @@ let sessionCounter = 0;
 const sessions = new Set();
 let generateCalls = 0;
 let narrationsLeft = 0;
+/** Every body the bridge used to create a session, so a test can assert on it. */
+const createBodies = [];
 
 function sseSay(text) {
   return { data: { text } };
@@ -171,6 +173,8 @@ const mockServer = (await import("node:http")).createServer(async (req, res) => 
   }
 
   if (p === "/api/session" && req.method === "POST") {
+    const body = await readBody(req);
+    createBodies.push(body);
     const id = "ses_mock_" + ++sessionCounter;
     sessions.add(id);
     return json(200, { id, title: "mock" });
@@ -592,6 +596,20 @@ console.log("\n-- abuse resistance --");
     body: "{}",
   });
   ok("an empty object counts as zero", emptyObj.status === 200, String(emptyObj.status));
+}
+
+console.log("\n-- the session must stay usable --");
+{
+  // A session carrying any deny rule is refused outright by the free tier, so
+  // the bridge must never ask for one. Measured on the real server: agent
+  // "build" 200, no agent 200, any deny rule 503. This is the assertion that
+  // stops the bridge regressing into a configuration where the model cannot be
+  // used at all.
+  ok("the bridge created at least one session", createBodies.length > 0, String(createBodies.length));
+  ok("no session requested a custom agent", !createBodies.some((b) => b.agent),
+    JSON.stringify(createBodies.find((b) => b.agent)));
+  ok("no session requested permissions", !createBodies.some((b) => b.permissions),
+    JSON.stringify(createBodies.find((b) => b.permissions)));
 }
 
 console.log("\n-- empty turn is terminal --");

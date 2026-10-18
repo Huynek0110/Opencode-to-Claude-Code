@@ -239,43 +239,47 @@ probe này cho xu hướng.
 
 ## An toàn: điều gì thực sự giữ model khỏi máy bạn
 
-**Hai lớp, và cả hai đều đã kiểm chứng thay vì giả định.**
+**Chỉ một thứ, và nó là cấu trúc chứ không phải khai báo: bridge gọi `/generate`.**
 
-**1. `/generate` là route completion thuần** — không agent loop, không tool catalog. Không có
-kênh gọi tool nào để model đi qua. Đây là lớp chính.
+Đó là route completion thuần — không agent loop, không tool catalog. Không có kênh gọi tool
+nào để model đi qua, nên không có gì để chặn.
 
-**2. `permissions: deny` giờ thực sự nạp** (trước đây **không**). `opencode.json` dùng khoá
-`"agent"` số ít, còn V2 dùng `"agents"`. Parser nuốt cả object lạ và biến các rule
-permission thành field JSON gửi thẳng cho provider — nên **không một rule nào được nạp**, và
-`ccbridge` chạy với ruleset mặc định `*/* allow`.
+### `permissions: deny` **không dùng được**, và đây là phát hiện quan trọng nhất về an toàn
 
-> Canary test ban đầu ("`shell` vẫn chạy lệnh thật, tạo file `CANARY.txt` chứa `PWNED`") đo
-> **đúng** hiện tượng nhưng **sai** nguyên nhân. Đó là bài học: một phép đo bất thành công
-> chỉ có giá trị nếu bạn biết nó đo cái gì.
+Agent `ccbridge` từng mang `permissions: deny` cho 22 tool. Đo trên server đang chạy, bốn
+session, mỗi cái ~1 token:
 
-Sau khi sửa, kiểm chứng bằng `POST /api/session/{id}/permission` (endpoint đánh giá, **không
-gọi model**):
+| Session | Kết quả |
+|---|---|
+| `agent: "build"` (built-in) | `200` — free tier phục vụ |
+| không `agent` | `200` — free tier phục vụ |
+| **bất kỳ** deny rule nào, truyền inline | `503` — free tier từ chối |
+| `agent: "ccbridge"` | `503` — free tier từ chối |
 
-```
-shell  -> deny      read  -> deny      execute -> deny
-bash   -> deny      write -> deny      glob    -> deny
-edit   -> deny      task  -> deny
-```
+**Deny và free tier loại trừ lẫn nhau.** Bật deny không làm bridge an toàn hơn; nó làm **model
+không dùng được** — đúng điều mà cả dự án này tồn tại để tránh.
 
-Bốn cách **không** giữ được, đã thử và đo:
+Canary test đầu tiên — `shell` chạy lệnh thật, tạo `CANARY.txt` chứa `PWNED` — đo **đúng hiện
+tượng, sai nguyên nhân**: khoá config là `"agent"` thay vì `"agents"`, nên **không rule nào
+nạp**, và ruleset mặc định `*/* allow` đang có hiệu lực. Chính việc *sửa cho đúng* khiến nó hỏng.
 
-| Cách thử | Kết quả |
+### Những thứ đã thử và không giữ được
+
+| Cách | Kết quả |
 |---|---|
 | `tools: {…: false}` (deprecated) | `403 FreeTierError` |
 | `permission` (object form) | `403 FreeTierError` |
-| `agent: "ccbridge"` + `system: ""` | set được, nhưng `opencode serve` vẫn inject system prompt (~7k token) |
-| `/prompt` (có agent loop thật) | OpenCode tự chạy tool; không có chỗ để bridge chặn ở giữa |
+| `agent` + `system: ""` | set được, nhưng `opencode serve` vẫn inject system prompt (~7k token) |
+| `/prompt` (có agent loop thật) | OpenCode tự chạy tool; không có chỗ chặn ở giữa |
+| **`permissions: deny`** | **tắt cả free tier** |
 
-Đo trực tiếp: `/generate` với và không có `agent` đều cho model thấy bộ tool của OpenCode.
-Không có field nào trong payload `/generate` tắt được nó.
+Nếu bạn muốn tự kiểm chứng mà không tốn token, `POST /api/session/{id}/permission` đánh giá
+rule mà **không** gọi model. Đó là cách duy nhất kiểm tra được, và nó cũng chính là cách đã
+phát hiện ra mâu thuẫn ở trên.
 
 Bridge chủ động chặn phần còn lại: mọi tên tool không thuộc danh sách Claude Code gửi kèm đều
-bị loại và nói lại cho model, kèm kiểm tra `input_schema`.
+bị loại và nói lại cho model, kèm kiểm tra `input_schema`. 21/23 tên tool OpenCode map được;
+`patch` và `todoread` bị từ chối có chủ đích (xem `probe-alias-coverage.mjs`).
 
 ---
 

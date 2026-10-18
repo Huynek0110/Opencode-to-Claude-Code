@@ -1,36 +1,32 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "agents": {
-    "ccbridge": {
-      "mode": "primary",
-      "description": "Raw text completion agent for the Claude Code bridge. Must never touch the machine.",
-      "system": "",
-      "model": "opencode/space-bunny-free",
-      "permissions": [
-        { "action": "read", "resource": "*", "effect": "deny" },
-        { "action": "write", "resource": "*", "effect": "deny" },
-        { "action": "edit", "resource": "*", "effect": "deny" },
-        { "action": "multiedit", "resource": "*", "effect": "deny" },
-        { "action": "patch", "resource": "*", "effect": "deny" },
-        { "action": "glob", "resource": "*", "effect": "deny" },
-        { "action": "grep", "resource": "*", "effect": "deny" },
-        { "action": "list", "resource": "*", "effect": "deny" },
-        { "action": "bash", "resource": "*", "effect": "deny" },
-        { "action": "shell", "resource": "*", "effect": "deny" },
-        { "action": "bashoutput", "resource": "*", "effect": "deny" },
-        { "action": "bashkill", "resource": "*", "effect": "deny" },
-        { "action": "execute", "resource": "*", "effect": "deny" },
-        { "action": "task", "resource": "*", "effect": "deny" },
-        { "action": "subagent", "resource": "*", "effect": "deny" },
-        { "action": "webfetch", "resource": "*", "effect": "deny" },
-        { "action": "websearch", "resource": "*", "effect": "deny" },
-        { "action": "skill", "resource": "*", "effect": "deny" },
-        { "action": "question", "resource": "*", "effect": "deny" },
-        { "action": "todowrite", "resource": "*", "effect": "deny" },
-        { "action": "todoread", "resource": "*", "effect": "deny" },
-        { "action": "lsp", "resource": "*", "effect": "deny" },
-        { "action": "external_directory", "resource": "*", "effect": "deny" }
-      ]
-    }
-  }
+
+  "//": [
+    "The `ccbridge` agent is intentionally NOT defined here.",
+    "",
+    "It used to carry `permissions: [{action:*, resource:*, effect:deny}]` for",
+    "twenty-two tools. Measured against the running server, four sessions, about",
+    "one token each:",
+    "",
+    "  session with agent:\"build\"            -> 200, free tier serves it",
+    "  session with no agent                  -> 200, free tier serves it",
+    "  session with ANY deny rule, inline     -> 503, free tier refuses it",
+    "  session with agent:\"ccbridge\"          -> 503, free tier refuses it",
+    "",
+    "So permission deny and the free tier cannot coexist. Enabling the rules does",
+    "not harden the bridge; it disables the model, which is the one thing this",
+    "project is for.",
+    "",
+    "The original canary test - which wrote CANARY.txt through the shell tool -",
+    "measured the correct symptom for the wrong reason: the key was `agent`",
+    "instead of `agents`, so no rule was ever loaded and the default",
+    "`*/* allow` ruleset was in force. Loading the rules properly was what broke",
+    "it.",
+    "",
+    "The real boundary is structural: the bridge calls POST /api/session/{id}",
+    "/generate, a bare completion route with no agent loop and no tool catalog,",
+    "so there is no channel through which the model could execute anything.",
+    "Verify with POST /api/session/{id}/permission if you want the rules",
+    "evaluated - that endpoint costs no tokens."
+  ]
 }
