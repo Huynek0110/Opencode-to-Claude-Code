@@ -79,7 +79,7 @@ if (-not $Live) {
     exit 1
   }
   Write-Host ""
-  Write-Host "all green, at no token cost (276 assertions)"
+  Write-Host "all green, at no token cost (281 assertions)"
   Write-Host "model-backed suites were skipped; run .\run-tests.ps1 -Live to include them"
   exit 0
 }

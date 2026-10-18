@@ -114,7 +114,7 @@ Chạy test:
 powershell -ExecutionPolicy Bypass -File ".\run-tests.ps1"
 ```
 
-Mặc định **276 assert, không tốn token nào**: `unit` (141) + `http` (47) + `mock` (88).
+Mặc định **281 assert, không tốn token nào**: `unit` (146) + `http` (47) + `mock` (88).
 
 `mock` là suite quan trọng nhất và là suite mới: nó dựng một `opencode serve` giả rồi chạy
 `bridge.mjs` thật (tiến trình con) đối diện với nó. Nhờ vậy test được toàn bộ contract —
