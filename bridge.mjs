@@ -415,6 +415,13 @@ const TOOL_ALIASES = {
   // is the better outcome.
   websearch: ["WebSearch"],
   task: ["Task"],
+  // Both names are registered by OpenCode; `Task` does not exist, so anything
+  // that means "delegate" has to land on Claude Code's name instead of failing.
+  subagent: ["Task"],
+  // OpenCode advertises `question` and Claude Code offers AskUserQuestion. It
+  // was absent from this table, so every attempt to ask the user a question was
+  // rejected and burned a retry.
+  question: ["AskUserQuestion"],
   skill: ["Skill"],
   notebookedit: ["NotebookEdit"],
   notebookread: ["NotebookRead"],
@@ -453,6 +460,9 @@ const INPUT_KEY_MAP = {
   // `pattern`, not `path`. Silently sending `path` produced a glob that matched
   // the wrong thing, with no error anywhere to say so.
   Glob: { include: "pattern", filePattern: "pattern", pattern: "pattern" },
+  // OpenCode's own tool description says so: "The `subagent` tool takes `agent`
+  // instead of `subagent_type`". Claude Code's Task schema wants subagent_type.
+  Task: { agent: "subagent_type", subagent_type: "subagent_type", prompt: "prompt", description: "description" },
   // Claude Code spells this `replace_all`. Passing `replaceAll` through untouched
   // is the worst kind of bug: the edit is applied once when it should have
   // replaced every occurrence, and nothing reports a failure.

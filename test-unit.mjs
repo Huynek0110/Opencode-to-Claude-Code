@@ -269,6 +269,13 @@ function eq(name, actual, expected) {
   eq("Glob limit dropped", "limit" in remapInput("Glob", { pattern: "*", limit: 5 }), false);
   // Cannot be mapped: Claude Code's equivalent is `-i`, which inverts the sense.
   eq("Grep caseSensitive dropped", "caseSensitive" in remapInput("Grep", { pattern: "x", caseSensitive: true }), false);
+  // From OpenCode's own embedded description: "The `subagent` tool takes `agent`
+  // instead of `subagent_type`".
+  eq("Task agent mapped to subagent_type", remapInput("Task", { agent: "explore", prompt: "go" }).subagent_type, "explore");
+  eq("subagent resolves to Task", resolveToolName("subagent", ["Task", "Read"]), "Task");
+  // OpenCode advertises `question`; Claude Code calls it AskUserQuestion.
+  eq("question resolves to AskUserQuestion", resolveToolName("question", ["AskUserQuestion", "Read"]), "AskUserQuestion");
+  eq("question is refused when not offered", resolveToolName("question", ["Read", "Write"]), null);
 }
 
 /* ------------------------------------------------ schema validation (#6) */
@@ -386,7 +393,11 @@ function eq(name, actual, expected) {
 
   // subagent must not become Task: OpenCode's injected prompt pushes it, and
   // Claude Code's Task runs agents in the background by default.
-  eq("subagent not aliased", resolveToolName("subagent", ["Task", "Read"]), null);
+  // OpenCode registers BOTH `task` and `subagent`, and does so in its own tool
+  // description. Leaving subagent out meant a model that followed that
+  // description had its call rejected and burned a retry.
+  eq("subagent resolves to Task", resolveToolName("subagent", ["Task", "Read"]), "Task");
+  eq("subagent is refused when Task is absent", resolveToolName("subagent", ["Read"]), null);
   eq("agent still aliased", resolveToolName("agent", ["Task", "Read"]), "Task");
 
   // notebook tools must not fall through to Edit/Read.

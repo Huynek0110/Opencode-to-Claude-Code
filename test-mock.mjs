@@ -18,14 +18,18 @@
  */
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const MOCK_PORT = 47611;
-const BRIDGE_PORT = 47811;
-const MOCK = `http://127.0.0.1:${MOCK_PORT}`;
-const BRIDGE = `http://127.0.0.1:${BRIDGE_PORT}`;
+// Ports are assigned by the OS rather than hard-coded. Two runs at once -
+// two terminals, or a reviewer working on the same checkout - collided on a
+// fixed port and one of them died with EADDRINUSE, which reads exactly like a
+// test failure and sends you hunting a bug that is not there.
+const FREE_PORT = 0;
+let MOCK = "";
+let BRIDGE = "";
 
 let pass = 0;
 let fail = 0;
@@ -215,7 +219,26 @@ const mockServer = (await import("node:http")).createServer(async (req, res) => 
   res.end("{}");
 });
 
-mockServer.listen(MOCK_PORT, "127.0.0.1");
+// Bind first, then read back what the OS gave us, so the URLs below are only
+// built once the ports are real.
+await new Promise((resolve, reject) => {
+  mockServer.once("error", reject);
+  mockServer.listen(FREE_PORT, "127.0.0.1", resolve);
+});
+const MOCK_PORT = mockServer.address().port;
+// The bridge gets its own free port, reserved by binding and releasing, so two
+// concurrent runs cannot both be handed the same number.
+const BRIDGE_PORT = await new Promise((resolve, reject) => {
+  const probe = createServer();
+  probe.once("error", reject);
+  probe.listen(FREE_PORT, "127.0.0.1", () => {
+    const p = probe.address().port;
+    probe.close(() => resolve(p));
+  });
+});
+MOCK = `http://127.0.0.1:${MOCK_PORT}`;
+BRIDGE = `http://127.0.0.1:${BRIDGE_PORT}`;
+console.log(`mock upstream on ${MOCK}, bridge on ${BRIDGE}`);
 
 /* ---------------------------------------------------------------- bridge */
 
