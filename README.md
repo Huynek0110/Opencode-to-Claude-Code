@@ -114,7 +114,7 @@ Chạy test:
 powershell -ExecutionPolicy Bypass -File ".\run-tests.ps1"
 ```
 
-Mặc định **211 assert, không tốn token nào**: `unit` (105) + `http` (47) + `mock` (59).
+Mặc định **247 assert, không tốn token nào**: `unit` (129) + `http` (47) + `mock` (71).
 
 `mock` là suite quan trọng nhất và là suite mới: nó dựng một `opencode serve` giả rồi chạy
 `bridge.mjs` thật (tiến trình con) đối diện với nó. Nhờ vậy test được toàn bộ contract —
@@ -172,26 +172,71 @@ Key `modelPicker.options[].behavesAs` là thứ làm điều đó — xem [SETTI
 
 ---
 
+## Chi phí token mỗi turn
+
+Đo trên một turn hình dạng Claude Code thật (23 tool, hội thoại có tool result 30 KB):
+
+| Phần | Token | Ghi chú |
+|---|---|---|
+| Schema 23 tool + protocol | ~7 300 | **giống hệt nhau mọi turn** |
+| Hội thoại + tool result | ~8 900 | phần thay đổi |
+| **Tổng (ước lượng của bridge)** | **~16 200** | |
+| Claude Code thật, đo từ `bridge.log` | ~42 000 | 26 tool, hội thoại sâu hơn |
+
+Khối 7.3k kia lặp lại nguyên vẹn mỗi turn và **không được cache**: `/generate` không lưu
+message và không có `cache_control`. Đây là chi phí cố định lớn nhất còn lại.
+
+**Đo hành vi model đừng dùng `claude -p`.** Một lượt Claude Code tốn ~32 000 input token trước
+khi model làm bất cứ việc gì, vì 23 tool schema cộng system prompt. `probe-behaviour.mjs` gửi
+3 tool và prompt một dòng — khoảng 1/20 chi phí:
+
+```powershell
+node probe-behaviour.mjs        # 4 case
+node probe-behaviour.mjs 5      # lặp 5 vòng để đo tỉ lệ
+```
+
+Nó **báo cáo, không assert**: một model free được phép hành xử khác nhau giữa những ngày khác
+nhau, và suite fail vì lý do đó dạy bạn phớt lờ suite. Dùng `test-mock.mjs` cho contract, dùng
+probe này cho xu hướng.
+
+---
+
 ## An toàn: điều gì thực sự giữ model khỏi máy bạn
 
-**Chỉ một thứ**: bridge dùng `/generate`, một route completion thuần không có agent loop
-và không có tool catalog. Không có kênh gọi tool nào để model đi qua.
+**Hai lớp, và cả hai đều đã kiểm chứng thay vì giả định.**
 
-Những thứ **không** giữ được, đã thử và đo:
+**1. `/generate` là route completion thuần** — không agent loop, không tool catalog. Không có
+kênh gọi tool nào để model đi qua. Đây là lớp chính.
+
+**2. `permissions: deny` giờ thực sự nạp** (trước đây **không**). `opencode.json` dùng khoá
+`"agent"` số ít, còn V2 dùng `"agents"`. Parser nuốt cả object lạ và biến các rule
+permission thành field JSON gửi thẳng cho provider — nên **không một rule nào được nạp**, và
+`ccbridge` chạy với ruleset mặc định `*/* allow`.
+
+> Canary test ban đầu ("`shell` vẫn chạy lệnh thật, tạo file `CANARY.txt` chứa `PWNED`") đo
+> **đúng** hiện tượng nhưng **sai** nguyên nhân. Đó là bài học: một phép đo bất thành công
+> chỉ có giá trị nếu bạn biết nó đo cái gì.
+
+Sau khi sửa, kiểm chứng bằng `POST /api/session/{id}/permission` (endpoint đánh giá, **không
+gọi model**):
+
+```
+shell  -> deny      read  -> deny      execute -> deny
+bash   -> deny      write -> deny      glob    -> deny
+edit   -> deny      task  -> deny
+```
+
+Bốn cách **không** giữ được, đã thử và đo:
 
 | Cách thử | Kết quả |
 |---|---|
-| `permissions: deny` trong agent config | `shell` vẫn chạy lệnh thật |
 | `tools: {…: false}` (deprecated) | `403 FreeTierError` |
 | `permission` (object form) | `403 FreeTierError` |
-| `agent: "ccbridge"` với `system: ""` | set được, **nhưng** `opencode serve` vẫn inject system prompt (~7k token) kể cả tool vocabulary |
+| `agent: "ccbridge"` + `system: ""` | set được, nhưng `opencode serve` vẫn inject system prompt (~7k token) |
+| `/prompt` (có agent loop thật) | OpenCode tự chạy tool; không có chỗ để bridge chặn ở giữa |
 
-Đo trực tiếp: `/generate` với và không có `agent` đều cho model thấy bộ tool của OpenCode
-(`execute`, `read`, `write`, `edit`, `grep`, `glob`, `list`). Không có field nào trong payload
-`/generate` tắt được nó.
-
-Bridge vẫn gửi `agent: "ccbridge"` (nó set thành công và giữ permission deny cho các route
-khác), nhưng **đừng hiểu nhầm** là config này đang bảo vệ bạn. Đường `/generate` mới là.
+Đo trực tiếp: `/generate` với và không có `agent` đều cho model thấy bộ tool của OpenCode.
+Không có field nào trong payload `/generate` tắt được nó.
 
 Bridge chủ động chặn phần còn lại: mọi tên tool không thuộc danh sách Claude Code gửi kèm đều
 bị loại và nói lại cho model, kèm kiểm tra `input_schema`.
@@ -209,8 +254,20 @@ bị loại và nói lại cho model, kèm kiểm tra `input_schema`.
 | `shell` | `Bash` | giữ `command`, `description`; **bỏ** `workdir`/`cwd` |
 | `read` | `Read` | `filePath` → `file_path` |
 | `write` | `Write` | `filePath` → `file_path` |
-| `edit` | `Edit` | `filePath` → `file_path`, `oldString`/`newString` → `old_string`/`new_string` |
-| `grep` / `glob` / `list` | `Grep` / `Glob` / `LS` | `include` → `glob`, `limit` → `head_limit` |
+| `edit` | `Edit` | `filePath` → `file_path`, `oldString`/`newString` → `old_string`/`new_string`, `replaceAll` → `replace_all` |
+| `grep` | `Grep` | `include` → `glob`, `limit` → `head_limit`; **bỏ** `caseSensitive` |
+| `glob` | `Glob` | `include` → `pattern`; **bỏ** `hidden`, `limit` |
+| `list` / `ls` / `dir` | `LS` → `Glob` → `Bash` | Claude Code **không có** tool `LS`, nên phải có fallback |
+
+**Vì sao phải map/bỏ key thay vì chuyển thẳng.** `input_schema` của Claude Code sinh từ Zod với
+`io:"output"`, nên **mọi** object đều có `additionalProperties: false`. Schema của OpenCode rộng
+hơn, và system prompt của nó **dạy model** dùng các key đó. Bridge vì thế đang được dạy để gửi
+key mà chính nó sẽ reject.
+
+Nghiêm trọng nhất là `replaceAll`: lọt nó qua là `Edit` thay **một** lần thay vì **tất cả** —
+và không có lỗi nào báo ra. Tương tự `Glob.path` sai thành `Glob.pattern` là match nhầm mà
+không có tín hiệu. `caseSensitive` **không** map được mà phải bỏ, vì Claude Code dùng `-i` —
+nghịch đảo chiều.
 
 Hai chốt an toàn:
 
@@ -225,8 +282,55 @@ Hai chốt an toàn:
 
 Bảng alias **cố ý hẹp**: chỉ từ vựng tool của OpenCode và vài từ đồng nghĩa thông thường.
 `readFile` kiểu camelCase **không** có trong bảng — đó là dạng tail của tool MCP. `patch` và
-`webfetch` cũng bị loại vì mapping là bất khả thi (diff thuần vs `old_string`/`new_string`),
-nên chỉ tạo ra schema violation rồi đốt một lượt retry.
+`webfetch` bị loại vì mapping là bất khả thi (diff thuần vs `old_string`/`new_string`;
+`format` vs `prompt`), nên chỉ tạo ra schema violation rồi đốt một lượt retry. Vì có nhánh so
+khớp không phân biệt hoa thường **đứng trước** bảng alias, `webfetch` từng lọt qua đúng lối đó
+— nên nay có `IMPOSSIBLE_ALIASES` kiểm tra trước.
+
+---
+
+## "Nói thay vì làm" — kiểu chết tệ nhất
+
+Model đôi khi viết *"Okay, continuing to read the rest of bridge.mjs, and kicking off research in
+parallel"*. Đó là **mô tả** hành động, không phải hành động. Turn kết thúc `end_turn` với 0
+tool call, Claude Code hiện "done", và **không có lỗi nào** để báo.
+
+Vòng review v4 đo được: 2/3 turn đầu thất bại, lượt cuối trả prose, cả turn chết trong im lặng.
+
+Ba lớp chống, theo thứ tự:
+
+1. **Prompt** — luật "không mô tả hành động, hãy làm nó" ở cả protocol lẫn closer cuối, có tác
+   dụng ngay từ lượt 0.
+2. **Correction riêng** — `narrated` khác `envelope`: *"describing an action performs none of
+   it"*.
+3. **`midToolLoop`** — phân biệt **kể sẽ làm giữa vòng lặp tool** với **câu mở đầu bình thường**,
+   đọc từ chính request: tin nhắn user cuối chỉ gồm `tool_result`, và chỉ model mới tạo được
+   tình huống đó. Giữa vòng lặp + narration → `400` nói thẳng lý do.
+
+`looksLikeNarration` được hiệu chỉnh trên 9 câu thật, và **cả hai chiều đều có test**:
+
+| Câu | Kết quả mong muốn |
+|---|---|
+| `"Okay, continuing to read the rest…"` | narration |
+| `"Continuing to read the rest…"` (không mở đầu "Okay") | narration |
+| `"I'll read the file for you."` | narration |
+| `"Okay, here is the summary you asked for."` | câu trả lời |
+| `"Sure, let me summarize what I found: effort is high."` | câu trả lời |
+| `"Okay, here is my plan:\n1. read…"`, 300 ký tự | câu trả lời |
+
+Bản đầu tiên của regex bắt **1/7** mẫu — kể cả chính ví dụ nằm trong docstring của nó — vì nó
+đòi mở đầu bằng `Okay`/`Sure`. Nguyên nhân là quyết định dựa trên **từ mở đầu**, và "Okay" hay
+"I'll" không quyết định điều gì.
+
+### Ba đường mất tool call hợp lệ — đã chặn
+
+- **`tool_choice: any` bị lách.** Hậu kiểm chỉ có cho `type:"tool"`, nên một câu trả lời văn
+  xuôi được tin là đã thoả `any`. Turn đóng `end_turn` trong khi client đã yêu cầu tool.
+- **`best` chấm điểm theo độ dài text.** `tools * 1000 + text.length` nghĩa là một đoạn văn
+  dài 1001 ký tự **thắng** một lời gọi `Read` thật. Nay so sánh tool trước, text sau (có trần).
+- **Envelope dạng mảng `[{name,input}]`** — đúng hình dạng native tool calling mà cả kiến trúc
+  sinh ra để chống lại — bị biến thành **JSON thô hiện ra cho user** với `end_turn`. Nay được
+  nhận thành tool call thật, và nhánh prose không bao giờ render JSON thô nữa.
 
 **`workdir` bị bỏ chứ không bị reject** — trường hợp đo được: model thêm `workdir` vì schema
 `bash` của OpenCode quảng bá nó, còn `Bash` của Claude Code có `additionalProperties: false`.
@@ -252,7 +356,12 @@ thật, trước đó là 5/8).
   để lại một cặp thất bại.
 - **HTTP status trì hoãn cho tới khi có phản hồi đầu tiên**, nên lỗi nhanh vẫn trả được
   status code thật thay vì `200` rỗng. Đặc biệt quan trọng cho **context overflow**:
-  Claude Code chỉ tự compact khi nhận `400` có chuỗi `ContextWindowExceededError`.
+  Claude Code tự compact khi body lỗi chứa `prompt is too long` hoặc
+  `input is too long for requested model`.
+  *(Đã kiểm tra binary `claude.exe`: chuỗi `ContextWindowExceededError` **không xuất hiện ở đâu
+  cả** — không trong tài liệu Anthropic, không trong client. Bridge từng "chạy được" chỉ vì cụm
+  ba chữ đầu của nó trùng với `prompt is too long` theo tình cờ. Giờ dùng đúng hai chuỗi mà
+  client thật sự match.)*
   *(Đã từng gọi `close()` trước `sendError()`, biến mọi lỗi nhanh thành `200` rỗng; hai
   reviewer độc lập cùng chỉ ra. `close()` giờ không `end()` nếu head chưa được gửi.)*
 - **`message_start` được phát đúng một lần, từ một chỗ duy nhất** — `onHead` của
@@ -270,7 +379,7 @@ thật, trước đó là 5/8).
 
 | Tình huống | Bridge trả về | Claude Code làm gì |
 |---|---|---|
-| Prompt vượt giới hạn input | `400` + `ContextWindowExceededError` + `x-should-retry: false` | tự compact rồi thử lại |
+| Prompt vượt giới hạn input | `400` + `x-should-retry: false` | tự compact rồi thử lại |
 | Model không tạo envelope sau 3 lượt | `400`, **không** retry | báo lỗi, dừng |
 | Body thiếu `model`/`messages`/`max_tokens` | `400 invalid_request_error`, **không** gọi model | báo lỗi, không tốn token |
 | Body quá 64 MB | `413 request_too_large` | báo lỗi |
@@ -402,9 +511,13 @@ khi debug cục bộ. Nguyên nhân gốc của mọi lỗi 500 vẫn được g
 | `claude-bridge.ps1` | Bật bridge rồi mở `claude` |
 | `effort.ps1` | Xem / đổi effort mặc định |
 | `run-tests.ps1` | Chạy test. Mặc định **không tốn token**; thêm `-Live` cho suite gọi model thật |
+| `RESEARCH-tool-call.md` | Contract Anthropic Messages API, đối chiếu mã nguồn `claude.exe` |
+| `RESEARCH-opencode-api.md` | Khả năng thật của `opencode serve`: route, permission, structured output |
+| `RESEARCH-json-reliability.md` | Structured output, thư viện parse JSON từ LLM, nghiên cứu về model nhỏ |
 | `test-unit.mjs` | Hàm thuần: parse, tool, transcript, effort — không cần mạng |
 | `test-http.mjs` | Lớp HTTP + `DeferredSSE`, không cần mạng — bắt lỗi status/streaming |
 | `test-mock.mjs` | Contract end-to-end với `opencode serve` giả — **miễn phí**, deterministic |
+| `probe-behaviour.mjs` | Đo hành vi model thật, **rẻ** (3 tool, ~1.2k token/turn). Báo cáo, không assert |
 | `test-sse.mjs` | Hợp đồng streaming end-to-end *(live)* |
 | `test-effort.mjs` | Effort end-to-end *(live)* |
 | `test-protocol.mjs` | 4 case dễ lỗi protocol *(live)* |

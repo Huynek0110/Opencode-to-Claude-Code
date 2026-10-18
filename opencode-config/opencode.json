@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "agent": {
+  "agents": {
     "ccbridge": {
       "mode": "primary",
       "description": "Raw text completion agent for the Claude Code bridge. Must never touch the machine.",

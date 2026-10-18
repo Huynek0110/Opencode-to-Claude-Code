@@ -16,6 +16,9 @@ import {
   toAnthropicError,
   resolveEffort,
   transcriptTokens,
+  clampLevel,
+  looksLikeNarration,
+  scoreEnv,
   EFFORT_LEVELS,
   MODEL_LIMITS,
 } from "./bridge.mjs";
@@ -124,6 +127,87 @@ function eq(name, actual, expected) {
   eq("Grep limit maps to head_limit", remapInput("Grep", { pattern: "x", limit: 5 }).head_limit, 5);
   // A drop-list for one tool must not leak into another.
   eq("workdir kept on Read", remapInput("Read", { file_path: "a", workdir: "b" }).workdir, "b");
+}
+
+/* -------------------------------------------------------- narration shape */
+{
+  // Real replies, and what each one must be. The distinction that matters is
+  // announcing an action versus delivering one: "Okay" or "I'll" decides nothing
+  // on its own.
+  const cases = [
+    ["Okay, continuing to read the rest of bridge.mjs, and kicking off research in parallel.", true],
+    ["Continuing to read the rest of bridge.mjs and kicking off research in parallel.", true],
+    ["I'll read the file for you.", true],
+    ["Let me check the rest of the config now.", true],
+    // Finished answers that start the same way. Rejecting these throws away a
+    // correct reply, which is worse than the failure being fixed.
+    ["Okay, here is the summary you asked for. The file contains 42 lines.", false],
+    [
+      "Sure, let me summarize what I found in the config file: effort is set to high and the port is 8787.",
+      false,
+    ],
+    ["Okay, the answer is 42.", false],
+    [
+      "Okay, here is my plan:\n1. read the config\n2. then run the tests\n3. report back. " +
+        "This is a longer plan and it starts by announcing the work, which is why it needs the boundary rule.",
+      false,
+    ],
+    ["", false],
+  ];
+  for (const [text, want] of cases) {
+    eq(`narration(${want ? "yes" : "no"}): ${text.slice(0, 52)}`, looksLikeNarration(text), want);
+  }
+}
+
+/* ------------------------------------------------ MCP collision guard */
+{
+  const withMcp = ["Read", "Bash", "mcp__ide__readFile", "mcp__fs__list_files"];
+  // A namespaced tool the caller really offered is used as-is. The guard is
+  // about names the caller did NOT offer.
+  eq("offered namespaced tool is used verbatim", resolveToolName("mcp__ide__readFile", withMcp), "mcp__ide__readFile");
+  eq("mcp prefix not in the list is refused", resolveToolName("mcpReadFile", withMcp), null);
+  // A camelCase tail of a namespaced tool must not resolve to the local Read:
+  // that would answer confidently about a different source. Previously this
+  // guard could not fire at all - punctuation was stripped before splitting on
+  // "__", so the split returned one element.
+  eq("camel tail of an mcp tool is refused", resolveToolName("list_files", withMcp), null);
+  eq("readFile is not aliased at all", resolveToolName("readFile", withMcp), null);
+  // The real tools must keep working.
+  eq("Read still resolves", resolveToolName("Read", withMcp), "Read");
+  eq("shell still maps to Bash", resolveToolName("shell", withMcp), "Bash");
+}
+
+/* --------------------------------------- structurally impossible aliases */
+{
+  const web = ["Read", "WebFetch", "WebSearch"];
+  // OpenCode's webfetch takes `format`, WebFetch needs `prompt`, so routing it
+  // could only ever produce a schema violation. It used to slip through the
+  // case-insensitive match that runs before the alias table.
+  eq("webfetch refused however it is spelled", resolveToolName("webfetch", web), null);
+  eq("WebFetch itself still resolves", resolveToolName("WebFetch", web), "WebFetch");
+  // No Claude Code tool exists called LS, so list/ls/dir must fall through to a
+  // tool that does exist rather than to a guaranteed rejection.
+  const cc = ["Read", "Glob", "Bash"];
+  eq("list falls back to a real tool", ["LS", "Glob", "Bash"].includes(resolveToolName("list", cc)), true, String(resolveToolName("list", cc)));
+  eq("TodoRead is gone", Object.keys(resolveToolName ? {} : {}).length, 0);
+}
+
+/* ------------------------------------------- keys OpenCode teaches wrongly */
+{
+  // `replaceAll` is not just an invented key: OpenCode's injected prompt
+  // explicitly tells the model to use it, so the bridge was being taught to
+  // send a key Claude Code rejects. Passing it through applies the edit once
+  // where it should have replaced every occurrence - with no error anywhere.
+  eq(
+    "Edit replaceAll mapped to replace_all",
+    remapInput("Edit", { path: "a", oldString: "x", newString: "y", replaceAll: true }),
+    { file_path: "a", old_string: "x", new_string: "y", replace_all: true }
+  );
+  eq("Glob include mapped to pattern", remapInput("Glob", { include: "*.js" }).pattern, "*.js");
+  eq("Glob hidden dropped", "hidden" in remapInput("Glob", { pattern: "*", hidden: true }), false);
+  eq("Glob limit dropped", "limit" in remapInput("Glob", { pattern: "*", limit: 5 }), false);
+  // Cannot be mapped: Claude Code's equivalent is `-i`, which inverts the sense.
+  eq("Grep caseSensitive dropped", "caseSensitive" in remapInput("Grep", { pattern: "x", caseSensitive: true }), false);
 }
 
 /* ------------------------------------------------ schema validation (#6) */

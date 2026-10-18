@@ -148,7 +148,14 @@ try {
   $text = ($probe.content | Where-Object { $_.type -eq "text" } | ForEach-Object { $_.text }) -join ""
   Write-Host "[ok]   live completion: $([Math]::Min(60, $text.Length)) chars, stop=$($probe.stop_reason)"
 } catch {
-  throw "the bridge is up but a real completion failed - check the opencode password and that OpenCode is logged in: $($_.Exception.Message)"
+  # The message matters: a 503 from a free tier says nothing about the password.
+  # Telling someone to check their credentials when they are simply rate-limited
+  # sends them into a config file that is already correct.
+  $detail = $_.Exception.Message
+  if ($detail -match "503|Rate limit|free tier|Service Unavailable") {
+    throw "the bridge is up, but the free tier refused the completion (rate limited). This is not a configuration problem - wait a minute and run this again.`n$detail"
+  }
+  throw "the bridge is up but a real completion failed - check the opencode password and that OpenCode is logged in: $detail"
 }
 
 # The child processes already have these in their own environment; leaving them

@@ -47,6 +47,7 @@ let delayMs = 0;
 let sessionCounter = 0;
 const sessions = new Set();
 let generateCalls = 0;
+let narrationsLeft = 0;
 
 function sseSay(text) {
   return { data: { text } };
@@ -74,6 +75,28 @@ function reply() {
       return sseSay("");
     case "long":
       return sseSay(JSON.stringify({ text: "x".repeat(60000) }));
+    case "narrate":
+      // The dominant real failure: a well-written sentence describing the action
+      // instead of taking it. This is what ends a turn with nothing done.
+      return sseSay("Okay, continuing to read the rest of bridge.mjs, and kicking off research in parallel.");
+    case "narration_then_tool":
+      narrationsLeft--;
+      return narrationsLeft > 0
+        ? sseSay("Sure. Let me read the config and check the tests.")
+        : sseSay(JSON.stringify({ text: "", tools: [{ name: "Read", input: { file_path: "a.txt" } }] }));
+    case "array_form":
+      // Native tool-calling shape: a bare array. What the deployment is being
+      // pushed towards, and it used to be rendered raw to the user.
+      return sseSay('[{"name":"Read","input":{"file_path":"C:/a.txt"}}]');
+    case "goodtool_then_prose":
+      // A real call plus one bad name (so the turn retries), then a long
+      // paragraph. The paragraph used to win on length.
+      if (narrationsLeft-- > 0) {
+        return sseSay(JSON.stringify({ tools: [{ name: "Read", input: { file_path: "C:/a.txt" } }, { name: "Nope", input: {} }] }));
+      }
+      return sseSay("Having examined the repository in some detail, here is what I found. ".repeat(20));
+    case "two_tools":
+      return sseSay(JSON.stringify({ tools: [{ name: "Read", input: { file_path: "a.txt" } }, { name: "Read", input: { file_path: "b.txt" } }] }));
     case "status":
       return { status: 503, text: JSON.stringify({ _tag: "ServiceUnavailableError", message: "Rate limit exceeded" }) };
     case "hang":
@@ -109,6 +132,7 @@ const mockServer = (await import("node:http")).createServer(async (req, res) => 
   if (p === "/api/mock/control") {
     const body = await readBody(req);
     if (body.mode) mode = body.mode;
+    if (body.narrations !== undefined) narrationsLeft = Number(body.narrations);
     if (body.delayMs !== undefined) delayMs = Number(body.delayMs);
     if (body.resetSessions) {
       sessions.clear();
@@ -336,6 +360,69 @@ console.log("\n-- max_tokens --");
   // Reported usage must describe what was sent, not the discarded draft.
   ok("output_tokens reflects the truncation", r.json.usage.output_tokens <= 20, String(r.json.usage.output_tokens));
   ok("output_tokens is not the full draft", r.json.usage.output_tokens < 60000 / 2.8 / 2, String(r.json.usage.output_tokens));
+}
+
+console.log("\n-- narration instead of action --");
+{
+  // Mid tool loop: the last user message is nothing but tool_result blocks. The
+  // model started this loop, so prose announcing the next step is not an answer.
+  const midLoop = {
+    messages: [
+      { role: "user", content: "read the config" },
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "a.txt" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "alpha" }] },
+    ],
+    tools: [READ_TOOL],
+  };
+
+  await control({ mode: "narrate", delayMs: 0 });
+  const r = await post(midLoop);
+  ok("mid-loop narration is not returned as an answer", r.status !== 200, String(r.status));
+  ok("mid-loop narration is a clear client error", r.status === 400, String(r.status));
+  ok(
+    "the error names the real cause",
+    /describ/i.test(r.json?.error?.message || ""),
+    JSON.stringify(r.json).slice(0, 180)
+  );
+
+  // Outside a tool loop the same sentence is a plausible opening answer, and
+  // rejecting it would break every ordinary conversation opener.
+  await control({ mode: "narrate", delayMs: 0 });
+  const okr = await post({ tools: [READ_TOOL] });
+  ok("narration outside a tool loop is still answered", okr.status === 200, String(okr.status));
+  ok("and it comes back as text", (okr.json.content || [])[0]?.type === "text");
+
+  // And the correction must actually recover: narrate once, then act.
+  await control({ mode: "narration_then_tool", narrations: 1, delayMs: 0 });
+  const rec = await post(midLoop);
+  ok("one narration is corrected into a real tool call", rec.status === 200, String(rec.status));
+  ok("the recovered call names the tool", rec.json?.content?.[0]?.name === "Read", JSON.stringify(rec.json?.content).slice(0, 140));
+}
+
+console.log("\n-- tool calls must not be lost --");
+{
+  await control({ mode: "array_form", delayMs: 0 });
+  const r = await post({ tools: [READ_TOOL] });
+  ok("bare array envelope becomes a tool call", r.json?.content?.[0]?.name === "Read", JSON.stringify(r.json?.content).slice(0, 160));
+  ok("raw JSON is never shown as the answer", r.json?.content?.[0]?.type === "tool_use", r.json?.content?.[0]?.type);
+
+  // A forced tool_choice outranks a sentence. `any` was enforced only on the
+  // retry path, so prose was believed and the turn closed having done nothing.
+  await control({ mode: "narrate", delayMs: 0 });
+  const any = await post({ tool_choice: { type: "any" }, tools: [READ_TOOL] });
+  ok("tool_choice any is not satisfied by prose", any.status !== 200, String(any.status));
+
+  // An envelope carrying a real call plus one bad name: the good call must win
+  // over a longer prose follow-up.
+  await control({ mode: "goodtool_then_prose", narrations: 1, delayMs: 0 });
+  const keep = await post({ tools: [READ_TOOL] });
+  ok("a valid tool call outranks later prose", keep.json?.content?.some((b) => b.type === "tool_use"),
+    JSON.stringify(keep.json?.content).slice(0, 160));
+
+  await control({ mode: "two_tools", delayMs: 0 });
+  const par = await post({ tool_choice: { type: "auto", disable_parallel_tool_use: true }, tools: [READ_TOOL] });
+  const toolBlocks = (par.json?.content || []).filter((b) => b.type === "tool_use");
+  ok("disable_parallel_tool_use keeps exactly one", toolBlocks.length <= 1, String(toolBlocks.length));
 }
 
 console.log("\n-- empty turn is terminal --");
