@@ -400,8 +400,10 @@ const TOOL_ALIASES = {
   edit: ["Edit"],
   grep: ["Grep"],
   glob: ["Glob"],
-  // Claude Code has no LS tool, so mapping only to it guaranteed a rejection on
-// every directory listing. Glob is the real tool for "what is here".
+  // `LS` does exist in Claude Code - it sits in the permission list alongside
+  // NotebookRead and MultiEdit. An earlier review claimed otherwise and this
+  // comment repeated the claim. Glob and Bash stay as fallbacks, which costs
+  // nothing and covers a caller that does not offer LS.
   list: ["LS", "Glob", "Bash"],
   todowrite: ["TodoWrite"],
   // `todoread` is absent on purpose. Claude Code has no TodoRead tool, so

@@ -293,7 +293,7 @@ bị loại và nói lại cho model, kèm kiểm tra `input_schema`.
 | `edit` | `Edit` | `filePath` → `file_path`, `oldString`/`newString` → `old_string`/`new_string`, `replaceAll` → `replace_all` |
 | `grep` | `Grep` | `include` → `glob`, `limit` → `head_limit`; **bỏ** `caseSensitive` |
 | `glob` | `Glob` | `include` → `pattern`; **bỏ** `hidden`, `limit` |
-| `list` / `ls` / `dir` | `LS` → `Glob` → `Bash` | Claude Code **không có** tool `LS`, nên phải có fallback |
+| `list` / `ls` / `dir` | `LS` → `Glob` → `Bash` | `LS` **có thật** (nằm trong danh sách permission cùng `MultiEdit`); hai mục sau là fallback |
 
 **Vì sao phải map/bỏ key thay vì chuyển thẳng.** `input_schema` của Claude Code sinh từ Zod với
 `io:"output"`, nên **mọi** object đều có `additionalProperties: false`. Schema của OpenCode rộng
