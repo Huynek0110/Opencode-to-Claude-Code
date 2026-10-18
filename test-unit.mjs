@@ -159,6 +159,35 @@ function eq(name, actual, expected) {
   }
 }
 
+/* ------------------------------------------ age-based tool result clearing */
+{
+  // A result from twenty turns ago costs the same as one from this turn and the
+  // model has usually moved on. Size-based caps cannot express that.
+  const msgs = [];
+  for (let i = 0; i < 20; i++) {
+    msgs.push({ role: "assistant", content: [{ type: "tool_use", id: `t${i}`, name: "Read", input: { file_path: `f${i}` } }] });
+    msgs.push({ role: "user", content: [{ type: "tool_result", tool_use_id: `t${i}`, content: "RESULT" + i }] });
+  }
+  const t = buildTranscript({ messages: msgs });
+  const clearedCount = (t.match(/cleared by the bridge/g) || []).length;
+  const kept = (t.match(/RESULT\d+/g) || []).length;
+  ok("old results are cleared", clearedCount > 0, String(clearedCount));
+  ok("recent results are kept", kept >= 6 && kept <= 6, String(kept));
+  ok("clearing is announced, not silent", /Call the tool again/.test(t));
+  // The newest result must survive: a bridge that clears what it needs next is
+  // worse than one that wastes tokens.
+  ok("the newest result is never cleared", /RESULT19\b/.test(t));
+
+  const few = buildTranscript({
+    messages: [
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "a", content: "ONE" }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "b", content: "TWO" }] },
+    ],
+  });
+  ok("a short history is never cleared", !/cleared by the bridge/.test(few));
+  ok("a short history is fully kept", /ONE/.test(few) && /TWO/.test(few));
+}
+
 /* ------------------------------------------------ MCP collision guard */
 {
   const withMcp = ["Read", "Bash", "mcp__ide__readFile", "mcp__fs__list_files"];
@@ -180,16 +209,21 @@ function eq(name, actual, expected) {
 /* --------------------------------------- structurally impossible aliases */
 {
   const web = ["Read", "WebFetch", "WebSearch"];
-  // OpenCode's webfetch takes `format`, WebFetch needs `prompt`, so routing it
-  // could only ever produce a schema violation. It used to slip through the
-  // case-insensitive match that runs before the alias table.
-  eq("webfetch refused however it is spelled", resolveToolName("webfetch", web), null);
+  // Refusing this outright was wrong. The incompatibility is in OpenCode's
+  // webfetch (`format`), not in the WebFetch the client offered (`prompt`), and
+  // validateInput already catches a mismatched call safely. It also cost a retry
+  // on every WebFetch call, because OpenCode's injected prompt advertises the
+  // lowercase name.
+  eq("webfetch resolves when the client offers WebFetch", resolveToolName("webfetch", web), "WebFetch");
+  // But it must still not resolve to something the caller never offered.
+  eq("webfetch refused when WebFetch is absent", resolveToolName("webfetch", ["Read", "Grep"]), null);
   eq("WebFetch itself still resolves", resolveToolName("WebFetch", web), "WebFetch");
+  eq("TodoRead is gone", resolveToolName("todoread", ["TodoWrite", "Read"]), null);
   // No Claude Code tool exists called LS, so list/ls/dir must fall through to a
   // tool that does exist rather than to a guaranteed rejection.
   const cc = ["Read", "Glob", "Bash"];
   eq("list falls back to a real tool", ["LS", "Glob", "Bash"].includes(resolveToolName("list", cc)), true, String(resolveToolName("list", cc)));
-  eq("TodoRead is gone", Object.keys(resolveToolName ? {} : {}).length, 0);
+  eq("TodoRead is gone", resolveToolName("todoread", ["TodoWrite", "Read"]), null);
 }
 
 /* ------------------------------------------- keys OpenCode teaches wrongly */

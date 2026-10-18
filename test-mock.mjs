@@ -97,6 +97,15 @@ function reply() {
       return sseSay("Having examined the repository in some detail, here is what I found. ".repeat(20));
     case "two_tools":
       return sseSay(JSON.stringify({ tools: [{ name: "Read", input: { file_path: "a.txt" } }, { name: "Read", input: { file_path: "b.txt" } }] }));
+    case "narrate_enveloped":
+      // Narration wearing a COMPLIANT envelope. This is the shape that made the
+      // whole narration layer unreachable: it parsed cleanly, so `best` filled,
+      // so the failure never got to fail.
+      return sseSay(JSON.stringify({ text: "Okay, I will read the rest of the file and check the tests.", tools: [] }));
+    case "text_only_envelope":
+      return sseSay(JSON.stringify({ text: "Here is a summary of what I found." }));
+    case "openai_shape":
+      return sseSay(JSON.stringify({ tool_calls: [{ function: { name: "Read", arguments: '{"file_path":"a.txt"}' } }] }));
     case "status":
       return { status: 503, text: JSON.stringify({ _tag: "ServiceUnavailableError", message: "Rate limit exceeded" }) };
     case "hang":
@@ -362,19 +371,19 @@ console.log("\n-- max_tokens --");
   ok("output_tokens is not the full draft", r.json.usage.output_tokens < 60000 / 2.8 / 2, String(r.json.usage.output_tokens));
 }
 
+// Mid tool loop: the last user message is nothing but tool_result blocks. The
+// model started this loop, so prose announcing the next step is not an answer.
+const midLoop = {
+  messages: [
+    { role: "user", content: "read the config" },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "a.txt" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "alpha" }] },
+  ],
+  tools: [READ_TOOL],
+};
+
 console.log("\n-- narration instead of action --");
 {
-  // Mid tool loop: the last user message is nothing but tool_result blocks. The
-  // model started this loop, so prose announcing the next step is not an answer.
-  const midLoop = {
-    messages: [
-      { role: "user", content: "read the config" },
-      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "a.txt" } }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "alpha" }] },
-    ],
-    tools: [READ_TOOL],
-  };
-
   await control({ mode: "narrate", delayMs: 0 });
   const r = await post(midLoop);
   ok("mid-loop narration is not returned as an answer", r.status !== 200, String(r.status));
@@ -423,6 +432,33 @@ console.log("\n-- tool calls must not be lost --");
   const par = await post({ tool_choice: { type: "auto", disable_parallel_tool_use: true }, tools: [READ_TOOL] });
   const toolBlocks = (par.json?.content || []).filter((b) => b.type === "tool_use");
   ok("disable_parallel_tool_use keeps exactly one", toolBlocks.length <= 1, String(toolBlocks.length));
+}
+
+console.log("\n-- a compliant envelope can still be a failure --");
+{
+  // Narration inside a VALID envelope. `test-mock` previously covered only bare
+  // prose, so the guarded branch - the one that produces the honest 400 - was
+  // never exercised, and the real log shows it had never fired once.
+  await control({ mode: "narrate_enveloped", delayMs: 0 });
+  const wrapped = await post(midLoop);
+  ok("enveloped narration still fails the turn", wrapped.status !== 200, String(wrapped.status));
+  ok("enveloped narration is a 400", wrapped.status === 400, String(wrapped.status));
+
+  // A genuinely finished text answer mid-loop must still be returned.
+  await control({ mode: "text_only_envelope", delayMs: 0 });
+  const done = await post(midLoop);
+  ok("a finished answer mid-loop is returned", done.status === 200, String(done.status));
+  ok("and it is text", done.json?.content?.[0]?.type === "text");
+
+  // A hard tool_choice is not satisfied by a well-formed text-only envelope.
+  await control({ mode: "text_only_envelope", delayMs: 0 });
+  const anyEnveloped = await post({ tool_choice: { type: "any" }, tools: [READ_TOOL] });
+  ok("tool_choice any rejects a text-only envelope", anyEnveloped.status !== 200, String(anyEnveloped.status));
+
+  // The native OpenAI shape: parsed once, this is a real tool call.
+  await control({ mode: "openai_shape", delayMs: 0 });
+  const oa = await post({ tools: [READ_TOOL] });
+  ok("OpenAI function shape becomes a tool call", oa.json?.content?.[0]?.name === "Read", JSON.stringify(oa.json).slice(0, 160));
 }
 
 console.log("\n-- empty turn is terminal --");

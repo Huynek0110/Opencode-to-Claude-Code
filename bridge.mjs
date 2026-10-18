@@ -62,13 +62,29 @@ const MODEL_LIMITS = {
 const FIXED_OVERHEAD_TOKENS = Number(process.env.BRIDGE_OVERHEAD_TOKENS || 12000);
 const EFFECTIVE_INPUT_LIMIT = Math.max(1000, MODEL_LIMITS.input - FIXED_OVERHEAD_TOKENS);
 
-const TOOL_RESULT_CAP = Number(process.env.BRIDGE_TOOL_RESULT_CAP || 24000);
+/**
+ * Per-result ceiling, in characters.
+ *
+ * 72 000, not 24 000. The old value was quoted as if it were tokens: Claude
+ * Code's own reference cap for tool output is 25 000 *tokens*, while 24 000
+ * *characters* is about 8 600 tokens - roughly three times tighter. Trimming
+ * tool results too hard loses the information the model needs, which shows up
+ * as floundering and extra retries, and a retry costs a whole prompt.
+ */
+const TOOL_RESULT_CAP = Number(process.env.BRIDGE_TOOL_RESULT_CAP || 72000);
 /**
  * Aggregate ceiling across every tool result in one turn. Ten results at the
  * per-result cap would be ~86k tokens of re-fetchable data; trimming here keeps
  * a large turn working instead of failing it outright.
  */
-const TOOL_RESULT_BUDGET = Number(process.env.BRIDGE_TOOL_RESULT_BUDGET || 160000);
+const TOOL_RESULT_BUDGET = Number(process.env.BRIDGE_TOOL_RESULT_BUDGET || 240000);
+
+/**
+ * How many of the most recent tool results are kept whole before age-based
+ * clearing starts replacing older ones. Enough to cover a working chain of reads
+ * and edits; older output is re-fetchable at the cost of one tool call.
+ */
+const CLEAR_KEEP_RECENT = Number(process.env.BRIDGE_CLEAR_KEEP_RECENT || 6);
 const MAX_ATTEMPTS = 3;
 
 /** Extra headroom: `max_tokens` * this is the character ceiling. */
@@ -430,15 +446,6 @@ const TOOL_ALIASES = {
 const INPUT_KEY_MAP = {
   Read: { path: "file_path", filePath: "file_path", file: "file_path" },
   Write: { path: "file_path", filePath: "file_path", file: "file_path" },
-  Edit: {
-    path: "file_path",
-    filePath: "file_path",
-    file: "file_path",
-    oldString: "old_string",
-    oldText: "old_string",
-    newString: "new_string",
-    newText: "new_string",
-  },
   NotebookRead: { path: "notebook_path", filePath: "notebook_path", file: "notebook_path" },
   NotebookEdit: { path: "notebook_path", filePath: "notebook_path", file: "notebook_path" },
   // OpenCode's grep takes `include` where Claude Code takes `glob`.
@@ -515,14 +522,14 @@ function resolveToolName(rawName, allowed) {
   if (allowed.includes(name)) return name;
 
   const lower = name.toLowerCase();
-  // Case-insensitive matching comes first, so an entry the alias table
-  // deliberately omits can still sneak in by spelling. `webfetch` did exactly
-  // that: OpenCode's takes `format`, WebFetch requires `prompt`, so the call
-  // could only ever come back as a schema violation - the outcome the omission
-  // was meant to prevent.
-  if (IMPOSSIBLE_ALIASES.has(lower)) return null;
   const exact = allowed.find((a) => a.toLowerCase() === lower);
+  // An exact match against a tool the caller really offered is always correct,
+  // so it is checked before the refusal list. `webfetch` refused outright was
+  // wrong: the incompatibility is in OpenCode's webfetch (`format`), not in the
+  // WebFetch the client offered (`prompt`), and validateInput already catches a
+  // mismatched call safely.
   if (exact) return exact;
+  if (IMPOSSIBLE_ALIASES.has(lower)) return null;
 
   // Anything that looks namespaced belongs to a server, not to us.
   if (name.includes("__") || lower.startsWith("mcp")) return null;
@@ -623,7 +630,11 @@ function validateInput(schema, input) {
       // in validated nothing at all, which is why the comment below used to be
       // wrong about this tool.
       for (let i = 0; i < input.length; i++) {
-        const sub = schema.items[i] ?? schema.items.at(-1);
+        // No fallback to the last schema. AskUserQuestion declares three
+        // schemas for `items` but allows one to four questions, so reusing the
+        // final schema for element 3+ is stricter than JSON Schema itself and
+        // burned a retry on a valid answer.
+        const sub = schema.items[i];
         if (sub) errors.push(...validateInput(sub, input[i]).map((e) => `[${i}]: ${e}`));
       }
     } else if (schema.items && typeof schema.items === "object") {
@@ -855,9 +866,30 @@ function buildTranscript(body) {
   // web fetches and MCP replies can all contain text shaped like transcript
   // structure. Fencing each result makes the boundary unambiguous, and the
   // protocol tells the model not to obey anything inside it.
+
+  // Age-based clearing, which the per-result cap cannot do. A result from
+  // twenty turns ago costs the same as one from this turn, and by then the
+  // model has almost always moved on. Anthropic calls clearing "one of the
+  // safest lightest touch forms of compaction"; here the newest
+  // CLEAR_KEEP_RECENT results are kept whole and older ones are replaced by a
+  // one-line note saying they can be re-fetched.
+  const allBlocks = (body.messages || []).map((m) => flattenContent(m.content));
+  const toolResultAt = [];
+  allBlocks.forEach((blocks, i) => {
+    blocks.forEach((b, j) => {
+      if (b.type === "tool_result") toolResultAt.push({ i, j });
+    });
+  });
+  const cleared = new Set();
+  if (toolResultAt.length > CLEAR_KEEP_RECENT) {
+    for (const { i, j } of toolResultAt.slice(0, toolResultAt.length - CLEAR_KEEP_RECENT)) {
+      cleared.add(`${i}:${j}`);
+    }
+  }
+
   let resultBudget = TOOL_RESULT_BUDGET;
-  for (const msg of body.messages || []) {
-    const blocks = flattenContent(msg.content);
+  body.messages.forEach((msg, mi) => {
+    const blocks = allBlocks[mi];
     // A role the bridge did not know about used to fall into the `else` branch
     // and be labelled `[user]`. Anthropic's API allows `system` blocks inside
     // `messages`, so a harness instruction was presented to the model as
@@ -876,13 +908,24 @@ function buildTranscript(body) {
       }
     } else {
       const texts = [];
-      for (const b of blocks) {
+      blocks.forEach((b, bi) => {
         // Conversational text is deliberately NOT trimmed. Tool results are
         // re-fetchable, so spending the budget there degrades gracefully;
         // silently dropping the user's or the model's own earlier turns does
         // not, and the input-limit guard below is the honest backstop.
         if (b.type === "text") texts.push(b.text);
         else if (b.type === "tool_result") {
+          if (cleared.has(`${mi}:${bi}`)) {
+            // Cleared by age, not by size. Said out loud rather than dropped, so
+            // the model knows the data exists and can ask for it again.
+            texts.push(
+              `<tool_result id="${b.id}"${b.is_error ? " error" : ""}>\n` +
+                "(cleared by the bridge: this result is old enough that it was dropped to keep the " +
+                "prompt affordable. Call the tool again if you still need its output.)\n" +
+                "</tool_result>"
+            );
+            return;
+          }
           const r = renderToolResult(b.content);
           // A floor of 2000 that ignored an exhausted budget turned
           // TOOL_RESULT_BUDGET into a soft ceiling: every result after the
@@ -903,10 +946,10 @@ function buildTranscript(body) {
               "\n</tool_result>"
           );
         }
-      }
+      });
       if (texts.length) lines.push("[user] " + texts.join("\n"));
     }
-  }
+  });
 
   lines.push("");
   // The closer restates the failure that actually happens: not malformed JSON but
@@ -1085,10 +1128,17 @@ if (!obj) return { text: "", tools: [], rejected: NO_REJECTIONS, recognized: fal
 
   for (const t of rawTools) {
     if (t == null || typeof t !== "object") continue;
-    const rawName = t.name ?? t.tool ?? t.tool_name;
+    // The OpenAI/Anthropic-native shape nests the call: {"function":{"name",
+    // "arguments"}}. `tool_calls` is a recognised envelope key, so a reply in
+    // that shape produced kind=null - the loop exited on the first attempt with
+    // no retry and no correction, and the turn died with a message claiming a
+    // native tool call had been discarded when the bridge had parsed it and
+    // thrown it away itself.
+    const fn = t.function ?? t.tool_call ?? null;
+    const rawName = t.name ?? t.tool ?? t.tool_name ?? fn?.name;
     if (!rawName) continue;
 
-    let input = t.input ?? t.arguments ?? t.args ?? t.parameters ?? {};
+    let input = t.input ?? t.arguments ?? t.args ?? t.parameters ?? fn?.arguments ?? {};
     if (typeof input === "string") {
       try {
         input = JSON.parse(input);
@@ -1165,7 +1215,13 @@ async function acquireSession(variant) {
         () => false
       );
       if (alive) {
-        entry.checkedAt = Date.now();
+        // Write the map entry back. Mutating the old object and then falling
+        // through to the `sessions.set` below left `inflight` pointing at an
+        // already-resolved promise FOREVER: the short-circuit at the top of this
+        // function returned it, so liveness was never probed again and a new
+        // session was never created. One `opencode serve` restart turned that
+        // into a permanent 500 with no way out but restarting the bridge.
+        sessions.set(key, { id: entry.id, inflight: null, checkedAt: Date.now() });
         return { id: entry.id };
       }
     }
@@ -1525,16 +1581,24 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
   const started = Date.now();
   const requestId = newId("req");
 
-  // Are we inside a tool loop the model itself started? The last user message
-  // is nothing but tool_result blocks in that case, and only the model can put
-  // it there.
+  // Are we inside a tool loop the model itself started? The last user message is
+  // nothing but tool_result blocks in that case, and only the model can put it
+  // there.
+  //
+  // Claude Code routinely attaches a `<system-reminder>` text block to the SAME
+  // user message that carries tool results. Requiring every block to be a
+  // tool_result therefore switched this off exactly on the longest turns - the
+  // ones with the most tool results and the most reminders - which is where a
+  // mid-loop turn is most likely to stall.
   const lastUser = (body.messages || [])
     .filter((m) => m.role === "user")
     .slice(-1)[0];
+  const lastBlocks = lastUser ? flattenContent(lastUser.content) : [];
+  const substantive = lastBlocks.filter(
+    (b) => !(b.type === "text" && /<system-reminder>/i.test(b.text || ""))
+  );
   const midToolLoop =
-    !!lastUser &&
-    flattenContent(lastUser.content).length > 0 &&
-    flattenContent(lastUser.content).every((b) => b.type === "tool_result");
+    substantive.length > 0 && substantive.every((b) => b.type === "tool_result");
   if (sse?.extra) {
     sse.extra["x-bridge-effort"] = effortLevel;
     sse.extra["x-bridge-effort-source"] = effortSource;
@@ -1612,11 +1676,26 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
 
       const parsed = normalizeEnvelope(extractJson(rawText), tools);
 
+      // Narration and an unmet hard tool_choice are decided BEFORE anything is
+      // remembered as usable. A text-only envelope is a perfectly valid
+      // candidate for `best` on paper, and that is exactly the problem:
+      // `{"text":"Okay, I will read the rest","tools":[]}` parsed cleanly, so
+      // `best` filled, so the `!best` guard downstream never let the turn fail -
+      // and it closed as 200 end_turn having done nothing. The whole narration
+      // layer therefore never fired once. Evidence in the real log: a turn with
+      // ptok=75517, attempts=3, stop=end_turn, calls=[] and zero narration
+      // events, which is the signature of a guard that cannot be reached.
+      const hardChoice = mustCallTool(body.tool_choice);
+      const candidateNarrated =
+        midToolLoop && !parsed.tools.length && !hardChoice && looksLikeNarration(parsed.text || rawText);
+
       // Keep the BEST usable attempt, not merely the last one. A turn that
       // produced a valid tool call and then followed up with prose must not
-      // lose the tool call.
+      // lose the tool call. Text-only replies are kept only when they are a
+      // genuine answer rather than a promise of one.
       const empty = !rawText.trim();
-      if (!empty && parsed.recognized && (parsed.tools.length || parsed.text)) {
+      const usable = !empty && parsed.recognized && (parsed.tools.length || (parsed.text && !candidateNarrated));
+      if (usable) {
         const score = scoreEnv(parsed);
         if (!best || score > best.score) best = { env: parsed, rawText, score, usage: res.usage };
       }
@@ -1630,8 +1709,7 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
       // `{"text":"Okay, I'll read the rest","tools":[]}` is the same failure
       // wearing a compliant hat: the model obeyed the shape and still did
       // nothing. Only meaningful inside a tool loop it started itself.
-      const narrated =
-        midToolLoop && !parsed.tools.length && !mustCallTool(body.tool_choice) && looksLikeNarration(parsed.text || rawText);
+      const narrated = candidateNarrated;
       // Narration outranks every other classification. When the envelope parsed
       // cleanly the reply has no rejection to report, so `kind` would be null
       // and the failure would sail straight through.
@@ -1647,7 +1725,17 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
                 ? "schema"
                 : null;
       const detail = kind ? (r.unknownName || r.badShape || r.badInput || []).slice(0, 4) : [];
-      const needsTool = mustCallTool(body.tool_choice) && !parsed.tools.length;
+      // An unmet hard tool_choice is a failure in its own right, even when the
+      // envelope is perfectly valid text. Only `type:"tool"` had a post-check,
+      // so `type:"any"` was satisfied by any sentence at all.
+      const needsTool = hardChoice && !parsed.tools.length;
+
+      // A reply that violated a hard tool_choice must not become the fallback
+      // either. Otherwise the last attempt restores a text-only `best` and the
+      // turn still closes as a success.
+      if (needsTool && best) {
+        best = best.env.tools.length ? best : null;
+      }
 
       if (kind || needsTool) {
         discarded = rawText;
@@ -1745,12 +1833,21 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
       }
     }
     const hasTool = content.some((b) => b.type === "tool_use");
-    if (choiceType === "tool" && !hasTool) {
+    // `any` was missing here. It has the same meaning as `tool` with no name:
+    // at least one tool call is mandatory. Measured side by side, one reply
+    // answered `any` with 200 end_turn and zero tool calls, while the identical
+    // reply was a 400 under `tool`. Half a hard constraint.
+    if ((choiceType === "tool" || choiceType === "any") && !hasTool) {
       // This check has to happen HERE, after the filter. Before it, a model that
       // called the wrong tool produced `parsed.tools.length === 1`, which
       // short-circuited the retry and turned a recoverable naming mistake into a
       // hard 400 on the first attempt.
-      throw new EmptyTurn(attempts, `tool_choice required "${forced}" but the model did not call it`);
+      throw new EmptyTurn(
+        attempts,
+        choiceType === "any"
+          ? 'tool_choice was "any" but the model returned no tool call'
+          : `tool_choice required "${forced}" but the model did not call it`
+      );
     }
 
     // A real field of the Anthropic API that was being ignored entirely: the

@@ -15,7 +15,8 @@
     .\run-tests.ps1 -Live
 
   -LiveCount caps how many model-backed suites run, which is the main lever on
-  token spend: effort (many calls) > load > protocol > bridge.
+  token spend: effort (many calls) > load > protocol > bridge. It only has an
+  effect together with -Live.
 #>
 [CmdletBinding()]
 param(
@@ -61,6 +62,11 @@ node test-mock.mjs
 $results.mock = $LASTEXITCODE
 
 if (-not $Live) {
+  if ($LiveCount) {
+    # Silently doing nothing after someone explicitly asked for a suite is worse
+    # than saying so.
+    Write-Warning "-LiveCount has no effect without -Live; no model-backed suite was run."
+  }
   Section "summary"
   foreach ($k in $results.Keys) {
     Write-Host ("  {0,-8} {1}" -f $k, $(if ($results[$k] -eq 0) { "PASS" } else { "FAIL" }))
@@ -72,7 +78,7 @@ if (-not $Live) {
     exit 1
   }
   Write-Host ""
-  Write-Host "all green, at no token cost (247 assertions)"
+  Write-Host "all green, at no token cost (261 assertions)"
   Write-Host "model-backed suites were skipped; run .\run-tests.ps1 -Live to include them"
   exit 0
 }

@@ -114,7 +114,7 @@ Chạy test:
 powershell -ExecutionPolicy Bypass -File ".\run-tests.ps1"
 ```
 
-Mặc định **247 assert, không tốn token nào**: `unit` (129) + `http` (47) + `mock` (71).
+Mặc định **261 assert, không tốn token nào**: `unit` (137) + `http` (47) + `mock` (77).
 
 `mock` là suite quan trọng nhất và là suite mới: nó dựng một `opencode serve` giả rồi chạy
 `bridge.mjs` thật (tiến trình con) đối diện với nó. Nhờ vậy test được toàn bộ contract —
@@ -183,8 +183,44 @@ Key `modelPicker.options[].behavesAs` là thứ làm điều đó — xem [SETTI
 | **Tổng (ước lượng của bridge)** | **~16 200** | |
 | Claude Code thật, đo từ `bridge.log` | ~42 000 | 26 tool, hội thoại sâu hơn |
 
-Khối 7.3k kia lặp lại nguyên vẹn mỗi turn và **không được cache**: `/generate` không lưu
-message và không có `cache_control`. Đây là chi phí cố định lớn nhất còn lại.
+Khối 7.3k kia lặp lại nguyên vẹn mỗi turn và **không thể cache** — không chỉ vì `/generate`
+không lưu message, mà vì `buildTranscript()` nén mọi thứ thành **một chuỗi duy nhất**. Gateway
+đặt điểm gãy cache ở cuối message đủ điều kiện gần nhất rồi nhìn lại các điểm gãy *trước đó*;
+với đúng một message thì không có điểm gãy nào để nhìn lại. Nên kể cả khi cổng có cache, mức
+tái sử dụng cũng gần bằng 0. Prompt caching là ngõ cụt ở đây.
+
+### Token lớn nhất không nằm ở schema, mà ở **retry**
+
+Đo từ `bridge.log` (62 turn hoàn tất, **0 token**):
+
+```
+phí retry = 471 340 token = 34,1% tổng input
+17/62 turn (27,4%) cần ≥ 2 lượt
+prompt trung bình 14 691 · lớn nhất 75 517
+```
+
+Một lượt retry thừa là **một lần gửi lại toàn bộ prompt**. Ở turn thật 42 588 token, mỗi lượt
+thừa lãng phí ~42 600 token. Thứ tự ưu tiên đúng là **giảm số lượt retry kích hoạt**, không
+phải tinh chỉnh schema. Phần lớn nguồn retry đã được vá: `tool_choice: any` không được ép,
+`best` nuốt mất tool call, hình dạng OpenAI bị vứt, `webfetch` tự đốt một retry.
+
+### Xoá tool result theo **tuổi**
+
+Trần theo kích thước không diễn đạt được điều này: một kết quả từ 20 lượt trước tốn y hệt kết
+quả của lượt này, và đến lúc đó model đã gần như đi sang việc khác. Anthropic gọi clearing là
+*"one of the safest lightest touch forms of compaction"*. 6 kết quả gần nhất được giữ nguyên,
+kết quả cũ hơn thay bằng một dòng nói rõ có thể gọi lại.
+
+Đo được:
+
+| Kịch bản | Có clearing | Không | Tiết kiệm |
+|---|---|---|---|
+| 14 result × 8 KB (thực tế) | 21 449 | 43 874 | **51%** (~22 400 token/turn) |
+| 14 result × 40 KB | 90 020 | 89 889 | 0 — ngân sách tổng đã chặn trước |
+
+**Đừng rút ngắn mô tả tool.** Trực giác bảo mô tả ngắn là tiết kiệm; tài liệu Anthropic khuyên
+ngược lại — *"Provide extremely detailed descriptions… Aim for at least 3–4 sentences for each
+tool description"*, và gọi bản mô tả ngắn là ví dụ **xấu**.
 
 **Đo hành vi model đừng dùng `claude -p`.** Một lượt Claude Code tốn ~32 000 input token trước
 khi model làm bất cứ việc gì, vì 23 tool schema cộng system prompt. `probe-behaviour.mjs` gửi
@@ -490,8 +526,9 @@ khi debug cục bộ. Nguyên nhân gốc của mọi lỗi 500 vẫn được g
 | `BRIDGE_OVERHEAD_TOKENS` | `12000` | Phần guard không nhìn thấy (system prompt của OpenCode, retry hints) |
 | `BRIDGE_CHARS_PER_TOKEN` | `2.8` | Hệ số ước lượng token khi dựng transcript |
 | `BRIDGE_OUT_CHARS_PER_TOKEN` | `3.2` | Hệ số quy đổi `max_tokens` → ngân sách ký tự cho **output** |
-| `BRIDGE_TOOL_RESULT_CAP` | `24000` | Ký tự tối đa cho **một** tool result |
-| `BRIDGE_TOOL_RESULT_BUDGET` | `160000` | Tổng ký tự cho mọi tool result trong một turn; hết ngân sách thì bridge nói rõ thay vì cắt âm thầm |
+| `BRIDGE_TOOL_RESULT_CAP` | `72000` | Ký tự tối đa cho **một** tool result. Claude Code tự tham chiếu 25 000 **token**, tức ~70 000 ký tự; con số cũ 24 000 ký tự là ~8 600 token, chặt gấp 3. |
+| `BRIDGE_TOOL_RESULT_BUDGET` | `240000` | Tổng ký tự cho mọi tool result trong một turn; hết ngân sách thì bridge nói rõ thay vì cắt âm thầm |
+| `BRIDGE_CLEAR_KEEP_RECENT` | `6` | Số tool result gần nhất được giữ nguyên; cũ hơn thì bị xoá **theo tuổi**, thay bằng một dòng nói rõ gọi lại được |
 | `BRIDGE_MAX_ATTEMPTS` | `3` | Số lượt thử tối đa cho một turn |
 | `BRIDGE_DEBUG` | — | `1` = ghi kèm nội dung reply bị loại vào log (mặc định chỉ ghi độ dài) |
 | `BRIDGE_HEAD_DELAY_MS` | `2500` | Chờ trước khi gửi header SSE |
