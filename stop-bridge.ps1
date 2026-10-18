@@ -21,6 +21,7 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
+$script:failed = $false
 
 function Test-Port([int]$Port) {
   return Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
@@ -52,6 +53,7 @@ function Stop-Port([int]$Port, [string]$Name) {
     # Reporting "[stop]" for a process that is still alive sends the user off to
     # run `claude` against a bridge they think they shut down.
     Write-Host "[FAIL] could not stop $Name (pid $pid_): $($_.Exception.Message)"
+    $script:failed = $true
     return
   }
   # Wait for the listener to actually go away. Returning immediately made
@@ -63,6 +65,7 @@ function Stop-Port([int]$Port, [string]$Name) {
   }
   if (Test-Port $Port) {
     Write-Host "[FAIL] $Name still listening on $Port after 5s"
+    $script:failed = $true
   } else {
     Write-Host "[stop] $Name (pid $pid_, port $Port)"
   }
@@ -70,3 +73,9 @@ function Stop-Port([int]$Port, [string]$Name) {
 
 Stop-Port $BridgePort "bridge.mjs"
 Stop-Port $OpenCodePort "opencode serve"
+
+# Exiting 0 while the bridge is still up lets any wrapper - task scheduler, CI,
+# `&&` chaining - report success, and the user goes on to run `claude` against a
+# bridge that never shut down.
+if ($script:failed) { exit 1 }
+exit 0

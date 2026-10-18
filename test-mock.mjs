@@ -106,6 +106,15 @@ function reply() {
       return sseSay(JSON.stringify({ text: "Here is a summary of what I found." }));
     case "openai_shape":
       return sseSay(JSON.stringify({ tool_calls: [{ function: { name: "Read", arguments: '{"file_path":"a.txt"}' } }] }));
+    case "finished_with_will":
+      // A correct final answer that happens to contain "will". Matching the bare
+      // word rejected this and charged three upstream calls for the privilege.
+      return sseSay(JSON.stringify({ text: "The service will restart automatically once the config is reloaded." }));
+    case "wrong_tool_then_right":
+      if (narrationsLeft-- > 0) {
+        return sseSay(JSON.stringify({ tools: [{ name: "Read", input: { file_path: "a.txt" } }] }));
+      }
+      return sseSay(JSON.stringify({ tools: [{ name: "Write", input: { file_path: "b.txt", content: "x" } }] }));
     case "status":
       return { status: 503, text: JSON.stringify({ _tag: "ServiceUnavailableError", message: "Rate limit exceeded" }) };
     case "hang":
@@ -262,6 +271,17 @@ const READ_TOOL = {
   input_schema: { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"], additionalProperties: false },
 };
 
+const WRITE_TOOL = {
+  name: "Write",
+  description: "Write a file.",
+  input_schema: {
+    type: "object",
+    properties: { file_path: { type: "string" }, content: { type: "string" } },
+    required: ["file_path", "content"],
+    additionalProperties: false,
+  },
+};
+
 async function post(body, { headers = {} } = {}) {
   const stream = !!body.stream;
   const payload = { model: "space-bunny-free", max_tokens: 4096, messages: [{ role: "user", content: "hi" }], ...body };
@@ -382,6 +402,25 @@ const midLoop = {
   tools: [READ_TOOL],
 };
 
+// Claude Code attaches a <system-reminder> to the SAME message as tool results.
+// A mutation test showed that removing the filter for these made the narration
+// guard silently switch itself off on exactly the longest turns, and no suite
+// caught it - because this variant did not exist.
+const midLoopWithReminder = {
+  messages: [
+    { role: "user", content: "read the config" },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "a.txt" } }] },
+    {
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "t1", content: "alpha" },
+        { type: "text", text: "<system-reminder>internal harness note</system-reminder>" },
+      ],
+    },
+  ],
+  tools: [READ_TOOL],
+};
+
 console.log("\n-- narration instead of action --");
 {
   await control({ mode: "narrate", delayMs: 0 });
@@ -444,6 +483,30 @@ console.log("\n-- a compliant envelope can still be a failure --");
   ok("enveloped narration still fails the turn", wrapped.status !== 200, String(wrapped.status));
   ok("enveloped narration is a 400", wrapped.status === 400, String(wrapped.status));
 
+  // The same turn with the <system-reminder> Claude Code really attaches. A
+  // mutation test showed removing that filter turns this back into a silent
+  // 200, and nothing caught it before this case existed.
+  await control({ mode: "narrate", delayMs: 0 });
+  const withReminder = await post(midLoopWithReminder);
+  ok("a system-reminder does not disable the narration guard", withReminder.status === 400, String(withReminder.status));
+
+  // A finished answer that happens to contain "will" is not narration. Matching
+  // bare "will" turned "The service will restart automatically" into a 400 after
+  // three paid upstream calls.
+  await control({ mode: "finished_with_will", delayMs: 0 });
+  const willed = await post(midLoop);
+  ok('a finished answer containing "will" survives', willed.status === 200, String(willed.status));
+  ok("and its text comes through", (willed.json?.content?.[0]?.text || "").includes("will"),
+    JSON.stringify(willed.json?.content).slice(0, 140));
+
+  // A forced tool_choice with a NAME: calling a different tool must retry rather
+  // than be deleted and reported as a hard 400 on the first attempt.
+  await control({ mode: "wrong_tool_then_right", narrations: 1, delayMs: 0 });
+  const forcedWrong = await post({ tool_choice: { type: "tool", name: "Write" }, tools: [READ_TOOL, WRITE_TOOL] });
+  ok("a wrong tool under a forced choice is retried and recovered", forcedWrong.status === 200, String(forcedWrong.status));
+  ok("and the right tool is the one that lands", forcedWrong.json?.content?.[0]?.name === "Write",
+    JSON.stringify(forcedWrong.json?.content).slice(0, 140));
+
   // A genuinely finished text answer mid-loop must still be returned.
   await control({ mode: "text_only_envelope", delayMs: 0 });
   const done = await post(midLoop);
@@ -459,6 +522,53 @@ console.log("\n-- a compliant envelope can still be a failure --");
   await control({ mode: "openai_shape", delayMs: 0 });
   const oa = await post({ tools: [READ_TOOL] });
   ok("OpenAI function shape becomes a tool call", oa.json?.content?.[0]?.name === "Read", JSON.stringify(oa.json).slice(0, 160));
+}
+
+console.log("\n-- abuse resistance --");
+{
+  // A page in any browser can POST to a loopback listener with no preflight.
+  // The inference would run and be charged even though the response cannot be
+  // read.
+  await control({ mode: "text", delayMs: 0 });
+  const before = (await (await fetch(MOCK + "/api/mock/control", { method: "POST", body: "{}" })).json()).data.generateCalls;
+  const evil = await fetch(BRIDGE + "/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "text/plain", Origin: "https://example.com" },
+    body: JSON.stringify({ model: "space-bunny-free", max_tokens: 64, messages: [{ role: "user", content: "hi" }] }),
+  });
+  const after = (await (await fetch(MOCK + "/api/mock/control", { method: "POST", body: "{}" })).json()).data.generateCalls;
+  ok("cross-origin request is refused", evil.status === 403, String(evil.status));
+  ok("and it never reached the model", after === before, `${before} -> ${after}`);
+
+  const local = await fetch(BRIDGE + "/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: "http://127.0.0.1:3000" },
+    body: JSON.stringify({ model: "space-bunny-free", max_tokens: 64, messages: [{ role: "user", content: "hi" }] }),
+  });
+  ok("a local origin still works", local.status === 200, String(local.status));
+
+  const dbg = await fetch(BRIDGE + "/debug/transcript", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "secret" }] }),
+  });
+  ok("/debug/transcript is gated off by default", dbg.status === 404, String(dbg.status));
+
+  // A JSON `null` body is malformed and must be a client error. An empty object
+  // is not: count_tokens on an empty conversation is legitimately zero.
+  const nullBody = await fetch(BRIDGE + "/v1/messages/count_tokens", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "null",
+  });
+  ok("a null body is a 4xx, not a 500", nullBody.status >= 400 && nullBody.status < 500, String(nullBody.status));
+
+  const emptyObj = await fetch(BRIDGE + "/v1/messages/count_tokens", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  ok("an empty object counts as zero", emptyObj.status === 200, String(emptyObj.status));
 }
 
 console.log("\n-- empty turn is terminal --");

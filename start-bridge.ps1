@@ -7,8 +7,10 @@
                        reason the free tier is allowed
   2. bridge.mjs      - Anthropic /v1/messages shim on 127.0.0.1:8787
 
-  Run this in its own window before launching `claude`. Both are idempotent:
-  re-running while they are up just re-checks health.
+  Run this in its own window before launching `claude`. Re-running while they are
+  up only re-checks health; a live completion is probed only when something was
+  actually started, because that probe is the one place in this repository that
+  costs tokens.
 
   The shared password is persisted to .opencode-password (gitignored). It has
   to be, because the two processes must agree and `opencode serve` keeps the
@@ -78,10 +80,20 @@ if (-not $Password) {
 }
 [System.IO.File]::WriteAllText($SecretFile, $Password)
 
+# Everything below runs inside try/finally. The child processes already inherit
+# these variables; leaving them behind puts the opencode password - and a stale
+# BRIDGE_EFFORT or OC_PORT that every later `node` in this shell would inherit -
+# into every command the user runs afterwards. A cleanup line at the end of the
+# script was skipped by all eight `throw`s above it, which is exactly when
+# leaving a password behind matters least and clearing it matters most.
+try {
+
 # ---- 1. opencode serve -------------------------------------------------------
+$startedAnything = $false
 if (Test-Port $OpenCodePort) {
   Write-Host "[ok]   opencode serve already listening on $OpenCodePort"
 } else {
+  $startedAnything = $true
   Write-Host "[start] opencode serve on $OpenCodePort"
   $exe = Resolve-OpenCode
   $env:OPENCODE_PASSWORD = $Password
@@ -101,6 +113,7 @@ if (Test-Port $OpenCodePort) {
 if (Test-Port $BridgePort) {
   Write-Host "[ok]   bridge already listening on $BridgePort"
 } else {
+  $startedAnything = $true
   Write-Host "[start] bridge on $BridgePort"
   $node = (Get-Command node.exe -ErrorAction SilentlyContinue | Select-Object -First 1)
   if (-not $node) { throw "node not found on PATH. Install Node 20+ and reopen the shell." }
@@ -137,6 +150,13 @@ try {
   throw "health check failed: $($_.Exception.Message)"
 }
 
+if (-not $startedAnything) {
+  Write-Host "[skip] everything was already running; not spending a token on a probe"
+  Write-Host ""
+  Write-Host "Ready. Launch Claude Code with:  claude"
+  return
+}
+
 try {
   $body = @{
     model = $h.model
@@ -158,10 +178,13 @@ try {
   throw "the bridge is up but a real completion failed - check the opencode password and that OpenCode is logged in: $detail"
 }
 
-# The child processes already have these in their own environment; leaving them
-# here puts the password into every later command run in this shell.
-Remove-Item Env:OC_PASS, Env:OPENCODE_PASSWORD -ErrorAction SilentlyContinue
-
 Write-Host ""
 Write-Host "Ready. Launch Claude Code with:  claude"
 Write-Host "Stop with: stop-bridge.ps1"
+
+}
+finally {
+  Remove-Item Env:OC_PASS, Env:OPENCODE_PASSWORD, Env:OPENCODE_CONFIG_DIR, `
+    Env:OC_PORT, Env:BRIDGE_PORT, Env:BRIDGE_EFFORT, Env:BRIDGE_AUX_EFFORT `
+    -ErrorAction SilentlyContinue
+}

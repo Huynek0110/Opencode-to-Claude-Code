@@ -564,15 +564,24 @@ function remapInput(name, input) {
   const drop = DROP_INPUT_KEYS[name];
   if (!map && !drop) return input;
   const out = {};
-  for (const [k, v] of Object.entries(input)) {
+  // Canonical keys first. `Glob` maps both `include` and `pattern` onto
+  // `pattern`, so with a single pass whichever came first in iteration order won
+  // - and `{include:"src", pattern:"*.js"}` kept the alias's value while
+  // reporting success. A correctly spelled key must always beat an alias.
+  const entries = Object.entries(input);
+  const targets = new Set(Object.values(map || {}));
+  for (const [k, v] of entries) {
+    if (drop?.includes(k)) continue;
+    if (map?.[k] === undefined && !(k in (map || {})) && targets.has(k)) out[k] = v;
+  }
+  for (const [k, v] of entries) {
     if (drop?.includes(k)) continue;
     const target = map?.[k];
     if (!target) {
-      out[k] = v;
+      if (!(k in out)) out[k] = v;
       continue;
     }
-    // Never let a remap clobber a key the model already spelled correctly. The
-    // alias is dropped rather than copied through: keeping it would leave a
+    // The alias is dropped rather than copied through: keeping it would leave a
     // residue key that `additionalProperties: false` then rejects.
     if (target in out) continue;
     out[target] = v;
@@ -759,9 +768,15 @@ function capText(text, cap) {
   const headEnd = headPart.lastIndexOf("\n");
   const keptHead = headEnd > 0 ? headPart.slice(0, headEnd) : headPart;
 
-  const tailPart = text.slice(text.length - tail);
-  const tailStart = tailPart.indexOf("\n");
-  const keptTail = tailStart >= 0 ? tailPart.slice(tailStart + 1) : tailPart;
+  let tailAt = text.length - tail;
+  // Never cut between the halves of a surrogate pair. Tool output is full of
+  // emoji, and a lone surrogate serialises to U+FFFD on the way to the SSE
+  // stream - so the tail, which is the part most often read, came back with a
+  // replacement character in it.
+  if (tailAt > 0 && tailAt < text.length && /[\uDC00-\uDFFF]/.test(text[tailAt])) tailAt -= 1;
+  const tailPart = text.slice(tailAt);
+  const nlAt = tailPart.indexOf("\n");
+  const keptTail = nlAt >= 0 ? tailPart.slice(nlAt + 1) : tailPart;
 
   const omittedLines = countLines(text) - countLines(keptHead) - countLines(keptTail);
   const marker =
@@ -873,7 +888,12 @@ function buildTranscript(body) {
   // safest lightest touch forms of compaction"; here the newest
   // CLEAR_KEEP_RECENT results are kept whole and older ones are replaced by a
   // one-line note saying they can be re-fetched.
-  const allBlocks = (body.messages || []).map((m) => flattenContent(m.content));
+  // One source of truth for the message list. The guard below used `body.messages
+  // || []` while the emitting loop used `body.messages.forEach` directly, so a
+  // body without `messages` threw a TypeError inside the loop and surfaced as a
+  // 500 `api_error` on /count_tokens and /debug/transcript instead of a 400.
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const allBlocks = messages.map((m) => flattenContent(m && m.content));
   const toolResultAt = [];
   allBlocks.forEach((blocks, i) => {
     blocks.forEach((b, j) => {
@@ -887,9 +907,27 @@ function buildTranscript(body) {
     }
   }
 
-  let resultBudget = TOOL_RESULT_BUDGET;
-  body.messages.forEach((msg, mi) => {
+  /**
+   * Budget is granted NEWEST FIRST.
+   *
+   * Walking the transcript forwards let the oldest results spend the whole
+   * allowance, and the newest ones - the data the model is about to reason over
+   * - came back as "call the tool again". Measured on 8 results of 60k
+   * characters: the four oldest were kept whole and the two newest were
+   * starved. Four large file reads is an ordinary turn.
+   */
+  const grants = new Map();
+  let remaining = TOOL_RESULT_BUDGET;
+  for (const { i, j } of toolResultAt) {
+    if (cleared.has(`${i}:${j}`)) continue;
+    const len = renderToolResult(allBlocks[i][j].content).length;
+    let share = Math.min(TOOL_RESULT_CAP, Math.max(0, remaining), len);
+    remaining -= share;
+    grants.set(`${i}:${j}`, share);
+  }
+  messages.forEach((msg, mi) => {
     const blocks = allBlocks[mi];
+    if (!msg || typeof msg !== "object") return;
     // A role the bridge did not know about used to fall into the `else` branch
     // and be labelled `[user]`. Anthropic's API allows `system` blocks inside
     // `messages`, so a harness instruction was presented to the model as
@@ -927,19 +965,15 @@ function buildTranscript(body) {
             return;
           }
           const r = renderToolResult(b.content);
-          // A floor of 2000 that ignored an exhausted budget turned
-          // TOOL_RESULT_BUDGET into a soft ceiling: every result after the
-          // budget ran out still got 2000 characters, so the real total was
-          // budget + 2000*(n-8). Now the budget is honoured, and a result that
-          // gets nothing says so instead of vanishing.
-          let share = Math.min(TOOL_RESULT_CAP, Math.max(0, resultBudget));
-          if (share > r.length) share = r.length;
-          resultBudget -= share;
-          const bodyText = share === 0
-            ? "(not shown: this turn's tool-result budget was already spent; call the tool again if you need its output)"
-            : r
-              ? capText(r, share)
-              : "(empty result)";
+          const share = grants.get(`${mi}:${bi}`) ?? 0;
+          // An empty result is an empty result. Checking the budget first made a
+          // perfectly ordinary "grep found nothing" say the budget had run out,
+          // which told the model to re-run a tool that had already answered.
+          const bodyText = !r
+            ? "(empty result)"
+            : share === 0
+              ? "(not shown: this turn's tool-result budget was already spent; call the tool again if you need its output)"
+              : capText(r, share);
           texts.push(
             `<tool_result id="${b.id}"${b.is_error ? " error" : ""}>\n` +
               bodyText +
@@ -1346,7 +1380,30 @@ function scoreEnv(env) {
   return env.tools.length * 1_000_000 + Math.min(999, env.text ? env.text.length : 0);
 }
 
-const NARRATION_ACTION = /\b(continuing|continue reading|reading the rest|will|i'?ll|let me|now i|going to|kicking off|proceeding to|next,? i|check(?:ing)? the rest|look at the rest)\b/;
+/**
+ * The action verbs a model names when it is announcing an action. Bare "will"
+ * is NOT one of them: "The service will restart automatically once the config is
+ * reloaded" is a finished answer, and matching it turned a correct reply into a
+ * 400 after three paid upstream calls. Precision matters more than recall here -
+ * a false negative costs one silent no-op, a false positive costs the answer
+ * plus every retry that went with it.
+ */
+const ACT_VERB = "(?:read|reads|check|checks|open|opens|run|runs|look|search|grep|examine|inspect|start|continue|write|edit|list|review|apply|then)";
+
+const NARRATION_ACTION = new RegExp(
+  [
+    `\\bi'?ll\\s+${ACT_VERB}\\b`,
+    `\\blet me\\s+${ACT_VERB}\\b`,
+    `\\b(?:continuing|proceeding|going|working)\\s+(?:to\\s+|on\\s+)?${ACT_VERB}\\b`,
+    `\\bkicking off\\b`,
+    `\\bnow i'?ll\\b`,
+    `\\bi am going to\\s+${ACT_VERB}\\b`,
+    `\\bnext,? i'?ll\\b`,
+    `\\breading the rest\\b`,
+    `\\bthe rest of the (?:file|config|code|project)\\b`,
+  ].join("|"),
+  "i"
+);
 
 function looksLikeNarration(text) {
   if (!text) return false;
@@ -1354,14 +1411,14 @@ function looksLikeNarration(text) {
   // step is still narration, and the old whole-string length cap silently
   // turned every long plan into a false negative.
   const head = text.slice(0, 400).trim();
-  const lower = head.toLowerCase();
-  if (!NARRATION_ACTION.test(lower)) return false;
+  if (!NARRATION_ACTION.test(head)) return false;
 
   // "...let me summarize what I found: effort is high" announces the act and
   // then delivers it. Everything after the first clause settles whether it did.
   // The intro clause runs long in practice, so the boundary has to allow a
   // generous one - a 40-character window cut off "Sure, let me summarize what
   // I found in the config file:" and rejected a finished answer.
+  const lower = head.toLowerCase();
   const colonAt = head.indexOf(":");
   const sentenceEnd = head.search(/[.!?]\s/);
   const boundary = colonAt >= 0 ? colonAt : sentenceEnd;
@@ -1726,9 +1783,13 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
                 : null;
       const detail = kind ? (r.unknownName || r.badShape || r.badInput || []).slice(0, 4) : [];
       // An unmet hard tool_choice is a failure in its own right, even when the
-      // envelope is perfectly valid text. Only `type:"tool"` had a post-check,
-      // so `type:"any"` was satisfied by any sentence at all.
-      const needsTool = hardChoice && !parsed.tools.length;
+      // envelope is perfectly valid text. With `type:"tool"` the NAMED tool
+      // counts: calling a different one satisfied `parsed.tools.length` and so
+      // skipped the retry entirely, turning a recoverable naming mistake into a
+      // hard 400 on the first attempt despite MAX_ATTEMPTS being 3.
+      const forcedName = body.tool_choice?.type === "tool" ? body.tool_choice.name : null;
+      const needsTool =
+        hardChoice && !(forcedName ? parsed.tools.some((t) => t.name === forcedName) : parsed.tools.length > 0);
 
       // A reply that violated a hard tool_choice must not become the fallback
       // either. Otherwise the last attempt restores a text-only `best` and the
@@ -2098,6 +2159,19 @@ async function handle(req, res) {
     res.end(JSON.stringify(obj));
   };
 
+  // A page in any browser can POST to a loopback listener. `mode: "no-cors"`
+  // with `Content-Type: text/plain` is a "simple request": it gets no preflight,
+  // and the response is unreadable - but the inference has already run and been
+  // charged. On a free tier that is a way for a random website to spend your
+  // quota. MAX_INFLIGHT limits concurrency, not volume.
+  const origin = req.headers.origin;
+  if (origin && !/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(origin)) {
+    return json(403, {
+      type: "error",
+      error: { type: "permission_error", message: `cross-origin request from ${origin} refused` },
+    });
+  }
+
   if (req.method === "GET" && (path === "/v1/models" || path === "/models")) {
     return json(200, {
       data: [
@@ -2148,6 +2222,15 @@ async function handle(req, res) {
       effort = loadEffort();
       return json(200, { ok: true, effort });
     }
+  }
+
+  // /debug/transcript echoes the caller's own messages back, tool results and
+  // file contents included. It is the only endpoint that returns user content,
+//  so it takes the same opt-in flag that controls writing it to the log.
+// /debug/sessions stays open: it returns variant names and a count, nothing
+// about the conversation.
+  if (path === "/debug/transcript" && !DEBUG_LOG) {
+    return json(404, { type: "error", error: { type: "not_found_error", message: "unknown route" } });
   }
 
   if (req.method === "GET" && path === "/debug/sessions") {

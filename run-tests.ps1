@@ -62,9 +62,10 @@ node test-mock.mjs
 $results.mock = $LASTEXITCODE
 
 if (-not $Live) {
-  if ($LiveCount) {
-    # Silently doing nothing after someone explicitly asked for a suite is worse
-    # than saying so.
+  # Only warn when the user actually typed it. $LiveCount has a default, so
+  # `if ($LiveCount)` was true on every plain run and printed a warning nobody
+  # had earned.
+  if ($PSBoundParameters.ContainsKey("LiveCount")) {
     Write-Warning "-LiveCount has no effect without -Live; no model-backed suite was run."
   }
   Section "summary"
@@ -78,7 +79,7 @@ if (-not $Live) {
     exit 1
   }
   Write-Host ""
-  Write-Host "all green, at no token cost (261 assertions)"
+  Write-Host "all green, at no token cost (276 assertions)"
   Write-Host "model-backed suites were skipped; run .\run-tests.ps1 -Live to include them"
   exit 0
 }

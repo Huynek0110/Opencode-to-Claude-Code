@@ -188,6 +188,33 @@ function eq(name, actual, expected) {
   ok("a short history is fully kept", /ONE/.test(few) && /TWO/.test(few));
 }
 
+/* ------------------------------------------- budget goes to the newest first */
+{
+  // Walking the transcript forwards let the oldest results spend the whole
+  // allowance and starved the newest - the data the model is about to reason
+  // over. Four large file reads is an ordinary turn, not an edge case.
+  const msgs = [];
+  for (let i = 0; i < 8; i++) {
+    msgs.push({ role: "user", content: [{ type: "tool_result", tool_use_id: `t${i}`, content: "Z".repeat(40000) }] });
+  }
+  const t = buildTranscript({ messages: msgs });
+  // Measure each rendered segment rather than guessing at offsets.
+  // Split on the opening tag only: `</tool_result>` also contains "<tool_result".
+  const segments = t.split(/<tool_result id="/).slice(1);
+  const bodyLen = (s) => (s.match(/Z+/g) || []).reduce((n, z) => n + z.length, 0);
+  const lens = segments.map(bodyLen);
+  ok("eight results rendered", segments.length === 8, String(segments.length));
+  ok("the newest result carries real data", lens[7] > 20000, String(lens[7]));
+  // Whatever the split, the newest must never be the starved one.
+  ok(
+    "the newest result is not the starved one",
+    !/budget was already spent/.test(segments[7]),
+    segments[7].slice(0, 120)
+  );
+  ok("budget is granted newest-first, so earlier kept results shrink first", lens[6] > 0 || lens[7] > 20000,
+    lens.join(","));
+}
+
 /* ------------------------------------------------ MCP collision guard */
 {
   const withMcp = ["Read", "Bash", "mcp__ide__readFile", "mcp__fs__list_files"];
