@@ -73,9 +73,28 @@ Do not claim the model can use tool call without a measurement that says so.
 "Implemented" and "the model uses it" are different claims, and conflating them
 was a real mistake here.
 
+**Update:** the measurement exists, in `bridge.log`, from 2026-10-18. Two real
+tool calls, one of them on the first attempt. See `EVIDENCE-model-toolcall.md`.
+Read it before claiming anything is unproven — and note it predates the current
+prompt, so the shipping contract is still unmeasured.
+
 ## Editing while someone else is reading
 
 If a subagent or another process is reading the repository, do not edit the
 files it is reading. Its report then describes code that no longer exists, and
 every finding has to be re-checked. Group the edits and apply them between
 rounds.
+
+The subtler version of that trap is `git add -A`. A reviewer running mutation
+tests **must** temporarily break the source, and `git status` then shows those
+in-flight mutations as ordinary edits. Committing them ships a knowingly broken
+version. It happened here: commit `e9766ac` captured a reviewer's live mutation
+of `renderToolResult` and lost `escapeFence` on the JSON fallback path.
+
+While any agent is running:
+
+- Never `git add -A` and never `git commit -a`. Stage by explicit path.
+- A `git diff` on a file you did not just edit means someone else is mid-edit.
+- Do not "fix" a surprising working-tree diff. It is probably deliberate and
+  temporary; reverting it out from under the agent corrupts its measurement.
+- Check `git diff` after any agent finishes, before you trust its report.
