@@ -58,17 +58,24 @@ if ($bad.Count) {
 }
 Write-Host "all files parse"
 
-Section "unit (no model, no bridge)"
-node test-unit.mjs
-$results.unit = $LASTEXITCODE
+$assertions = 0
 
-Section "http layer (no model, no bridge)"
-node test-http.mjs
-$results.http = $LASTEXITCODE
+function Suite($key, $label, $script) {
+  Section $label
+  # The count is parsed, not written down. It was hardcoded at 281 and stayed
+  # wrong through several rounds while suites quietly grew past it, which is the
+  # whole reason nobody noticed the prompt had no coverage.
+  $out = & node $script 2>&1
+  $code = $LASTEXITCODE
+  $out | ForEach-Object { Write-Host $_ }
+  $m = ($out | Select-String -Pattern "(\d+) passed" | Select-Object -Last 1)
+  if ($m) { $script:assertions += [int]$m.Matches[0].Groups[1].Value }
+  $results[$key] = $code
+}
 
-Section "contract against a mock upstream (no model, no tokens)"
-node test-mock.mjs
-$results.mock = $LASTEXITCODE
+Suite "unit" "unit (no model, no bridge)" "test-unit.mjs"
+Suite "http" "http layer (no model, no bridge)" "test-http.mjs"
+Suite "mock" "contract against a mock upstream (no model, no tokens)" "test-mock.mjs"
 
 if (-not $Live) {
   # Only warn when the user actually typed it. $LiveCount has a default, so
@@ -88,7 +95,7 @@ if (-not $Live) {
     exit 1
   }
   Write-Host ""
-  Write-Host "all green, at no token cost (281 assertions)"
+  Write-Host "all green, at no token cost ($assertions assertions)"
   Write-Host "model-backed suites were skipped; run .\run-tests.ps1 -Live to include them"
   exit 0
 }

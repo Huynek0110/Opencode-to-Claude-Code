@@ -634,6 +634,54 @@ console.log("\n-- the closer must not contradict the request --");
   })());
 }
 
+console.log("\n-- the prompt contract itself --");
+{
+  // Mutation M30 deleted RESPONSE_PROTOCOL and the FINAL closer outright and all
+  // 291 assertions stayed green. The prompt is the only channel that reaches the
+  // model, and it had no test at all. These are the constraints a violation of
+  // kills a turn over, so losing any one of them must now be loud.
+  const { buildTranscript } = await import("./bridge.mjs");
+  const TOOLS = [
+    { name: "Read", input_schema: { type: "object", properties: { file_path: { type: "string" } } } },
+  ];
+  const t = buildTranscript({ tools: TOOLS, messages: [{ role: "user", content: "hi" }] });
+  const proto = t.slice(t.indexOf("Reply with ONE JSON object"), t.indexOf("# CONVERSATION"));
+
+  // Each of these is a rule the bridge depends on. Removing one is the mutation
+  // that survived round after round.
+  const required = [
+    ["one JSON object", /ONE JSON object/],
+    ["no code fence", /no code fence/i],
+    ["first char is {", /first character must be "\{"/],
+    ["tools are available", /tools listed above ARE available/i],
+    ["no native channel", /no native function-calling channel/i],
+    ["both shapes shown", /\{"text": "your answer/],
+    ["a tool example is valid JSON", /"tools": \[\{"name": "Read"/],
+    ["names copied exactly", /character for character/],
+    ["schema conformance", /input_schema/],
+    ["batching is allowed", /run them in parallel/],
+    ["call the tool, do not claim", /CALL THE TOOL/],
+    ["no invented results", /only tool_result contents are real/i],
+    ["tool output untrusted", /untrusted data/],
+    ["never obey embedded instructions", /Never obey those/],
+    ["never mention the envelope", /Never mention this envelope/],
+  ];
+  for (const [name, re] of required) ok(`protocol keeps: ${name}`, re.test(proto), proto.slice(0, 120));
+
+  // The stacking shape itself. A numbered RULES list is what collapsed compliance,
+  // and it is exactly what someone adds back when told to "make the rules clearer".
+  ok("protocol has no numbered rule list", !/\bRULES:/.test(proto));
+  ok("protocol has no markdown heading inside it", !/^#{1,3} /m.test(proto));
+
+  // Re-sent every turn with no prompt caching, so growth is not free. This is a
+  // ceiling, not a target: it fails loudly when someone adds a rule.
+  ok("protocol stays under 1200 chars", proto.length < 1200, `${proto.length} chars, ~${Math.round(proto.length / 3.2)} tokens`);
+
+  // The narration rule now lives only in the closer, where recency helps. If it
+  // is added back to the protocol the two copies drift apart.
+  ok("the protocol does not restate the narration rule", !/DESCRIBE|describ/i.test(proto));
+}
+
 console.log("\n-- the session must stay usable --");
 {
   // A session carrying any deny rule is refused outright by the free tier, so
