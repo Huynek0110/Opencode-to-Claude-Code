@@ -16,6 +16,8 @@ That is enough to exhaust the quota on its own.
 claude -p  (any form, including via claude-bridge.ps1)
 node probe-toolcall.mjs
 node probe-behaviour.mjs
+node probe-free-tier-gate.mjs      <-- four /generate calls, ~4 000 tokens
+node probe-narration-echo.mjs      <-- six /generate calls, ~8 000 tokens
 powershell -File .\start-bridge.ps1      <-- probes a real completion when it starts something
 powershell -File .\run-tests.ps1 -Live  <-- and every -LiveCount suite
 node test-load.mjs
@@ -24,6 +26,12 @@ node test-protocol.mjs
 node test-sse.mjs
 node test-bridge.mjs
 ```
+
+`node mutation-check.mjs` is deliberately NOT on that list. It breaks bridge.mjs
+on purpose but never contacts a provider - it costs nothing.
+
+Every other `probe-*.mjs` spends money. If you are about to run one, the question
+is not "is it cheap" but "has the user said yes to this specific run".
 
 Also forbidden: `POST /api/session/{id}/generate` and `/prompt` with a real
 prompt, from curl, from a script, or from anything else.
