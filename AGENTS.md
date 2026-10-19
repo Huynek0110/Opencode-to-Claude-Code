@@ -35,13 +35,17 @@ anything, and a rate limit then reports itself as a configuration failure.
 ### Allowed — zero token
 
 ```
-node test-unit.mjs            154 assertions, imports the pure functions
+node test-unit.mjs            170 assertions, imports the pure functions
 node test-http.mjs             47 assertions, drives DeferredSSE against a fake response
-node test-mock.mjs             91 assertions, spawns a FAKE opencode serve
+node test-mock.mjs            116 assertions, spawns a FAKE opencode serve
 node --check <file>
 node probe-alias-coverage.mjs  pure functions
 powershell -File .\run-tests.ps1        no -Live: runs only the three above
 ```
+
+The runner prints the real total (333) because it parses each suite's count.
+It used to print a hardcoded 281 that stayed wrong while the suites grew — which
+is part of why the prompt going untested went unnoticed. Do not hardcode it again.
 
 `test-mock.mjs` is not a loophole: it stands up its own mock upstream and points
 a real `bridge.mjs` child process at it, so no provider is ever contacted. If a

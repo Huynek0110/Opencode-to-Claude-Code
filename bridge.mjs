@@ -1092,7 +1092,7 @@ function buildTranscript(body) {
     lines.push(
       "FINAL: reply with ONE JSON object and nothing else, of the form\n" +
         '{"text":"<your message>"}\n' +
-        'and no "tools" key. Do not emit a native tool call either; only the JSON object is read.'
+        'and no other key. Do not emit a native tool call either; only the JSON object is read.'
     );
   }
 
