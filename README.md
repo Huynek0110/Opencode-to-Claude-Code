@@ -508,6 +508,34 @@ thật, trước đó là 5/8).
 
 ---
 
+## Streaming và non-streaming phải báo lỗi giống nhau
+
+Đo ở vòng 10, trên **cùng một lỗi** (vượt ngân sách token của lượt):
+
+| | status | `x-should-retry` | `retry-after` |
+|---|---|---|---|
+| non-streaming | `503` | `true` | `2` |
+| streaming | `200` | — | — |
+
+Streaming không có status nữa: `message_start` đã flush header. Nên client nhận một
+`error` event trên một `200` **không có tín hiệu retry nào**. Một lỗi *đáng retry*
+biến thành *không đáng retry* — đắt nhất, vì phản ứng đúng duy nhất của client là chờ
+rồi thử lại, và không ai bảo nó làm vậy.
+
+Ba sửa:
+
+1. **Prompt vượt ngân sách bị từ chối ngay ở preflight**, trước khi gửi byte SSE nào.
+   Trong vòng retry cùng điều kiện này vẫn bị bắt, nhưng lúc đó đã quá muộn. Không có
+   token nào bị tiêu — thông báo nói rõ điều đó.
+2. **`retryAfterMs(status)` tách ra dùng chung.** Hai đường báo lỗi không được phép lệch
+   nhau; chúng đã lệch và không ai thấy.
+3. **`error` event giờ mang `should_retry` và `retry_after_ms`.** Ngoài schema Anthropic
+   nên là best-effort: client bỏ qua thì y như cũ.
+
+Nhánh streaming cũng ghi log kèm `cause` và `request-id`. Trước đó nó chỉ ghi
+`{status, type, midStream}` — tức đúng những lỗi khó tái hiện nhất lại là những cái
+không có gì trong log.
+
 ## Xử lý lỗi
 
 | Tình huống | Bridge trả về | Claude Code làm gì |

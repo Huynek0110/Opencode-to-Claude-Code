@@ -2315,6 +2315,21 @@ function toAnthropicError(err) {
   };
 }
 
+/**
+ * How long to tell a client to wait before retrying a retryable failure.
+ *
+ * Shared, because the two paths that report a retryable failure must not be
+ * able to disagree. Round 10 measured them disagreeing: the non-streaming path
+ * returned 503 with retry-after 2 and x-should-retry true, while the streaming
+ * path - which had already flushed its headers - returned a bare error event on
+ * a 200 with neither. A retryable failure that arrives unretryable is worse
+ * than a hard failure, because the client stops trying something that would
+ * have worked.
+ */
+function retryAfterMs(status) {
+  return status === 429 ? 5000 : 2000;
+}
+
 function sendError(res, err) {
   const e = toAnthropicError(err);
   // The log keeps the original cause. The client gets the sanitized text, but an
@@ -2338,11 +2353,11 @@ function sendError(res, err) {
   // 502 from OpenCode was flagged retryable but fell back to the SDK's own
   // exponential backoff instead of the 2s the bridge actually wants.
   if (e.shouldRetry) {
-    const secs = e.status === 429 ? 5 : 2;
-    res.setHeader("retry-after", String(secs));
+    const ms = retryAfterMs(e.status);
+    res.setHeader("retry-after", String(ms / 1000));
     // The Anthropic SDK reads retry-after-ms BEFORE retry-after, so it wins.
     // Emitting only the seconds form left the client on its own backoff.
-    res.setHeader("retry-after-ms", String(secs * 1000));
+    res.setHeader("retry-after-ms", String(ms));
   }
   res.writeHead(e.status, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ type: "error", error: { type: e.type, message: e.message } }));
@@ -2515,6 +2530,30 @@ async function handle(req, res) {
   if (preflight > EFFECTIVE_INPUT_LIMIT) {
     return sendError(res, new ContextTooLong(preflight + FIXED_OVERHEAD_TOKENS, MODEL_LIMITS.input));
   }
+  // A single prompt that cannot fit the per-turn budget is refused HERE, before
+  // a single byte of SSE is written.
+  //
+  // Inside the retry loop this condition is also caught, but by then
+  // message_start has already gone out and the failure can only be reported as
+  // an `error` event on a 200. Round 10 measured the difference: the streaming
+  // path returned status 200 with no x-should-retry and no retry-after, while
+  // the non-streaming path returned 503 with both. A retryable failure that
+  // arrives as an unretryable one is the most expensive kind of asymmetry this
+  // bridge can have, because the client's only correct response - wait and try
+  // again - is the thing it is not told to do.
+  if (TURN_TOKEN_BUDGET > 0 && preflight > TURN_TOKEN_BUDGET) {
+    // `status: 503` is what makes toAnthropicError classify this as a retryable
+    // upstream failure rather than an internal bug - which is correct: nothing is
+    // wrong with the bridge, this turn is simply too expensive to be worth sending,
+    // and a smaller one is worth trying.
+    const tooBig = new Error(
+      `the prompt is ${preflight} tokens, over this turn's ${TURN_TOKEN_BUDGET} token budget; ` +
+        `nothing was sent to the model, so nothing was spent`
+    );
+    tooBig.status = 503;
+    tooBig.name = "TurnBudgetExceeded";
+    return sendError(res, tooBig);
+  }
 
   const earlyMsgId = newId("msg");
 
@@ -2574,8 +2613,36 @@ async function handle(req, res) {
           // Anthropic terminates a stream with an `error` event and omits
           // message_delta/message_stop. Emitting message_stop first would tell
           // the client the turn succeeded and leave a failed pair behind it.
-          sse.event("error", { type: "error", error: { type: e.type, message: e.message } });
-          logRequest("error", { status: e.status, type: e.type, midStream: true });
+          // Headers are long gone by this point - message_start flushed them -
+          // so a retryable failure used to reach a streaming client as a bare
+          // error event on a 200, with no x-should-retry and no retry-after. The
+          // non-streaming path returns 503 with both. Round 10 measured that
+          // asymmetry on one and the same failure, and it is the expensive kind:
+          // the client's only correct response is to wait and try again, and
+          // nothing told it to.
+          //
+          // These extra fields are outside the Anthropic error schema, so they
+          // are best-effort: a client that ignores them behaves exactly as
+          // before. A client that reads them can retry instead of reporting a
+          // dead turn to the user.
+          sse.event("error", {
+            type: "error",
+            error: { type: e.type, message: e.message },
+            should_retry: e.shouldRetry === true,
+            retry_after_ms: e.shouldRetry === true ? (retryAfterMs(e.status) || 2000) : undefined,
+          });
+          // The non-streaming branch logs the cause and the request id; this one
+          // did not, so exactly the failures that are hardest to reproduce - the
+          // ones that happen after a stream has already started - were the ones
+          // with nothing in the log.
+          logRequest("error", {
+            status: e.status,
+            type: e.type,
+            midStream: true,
+            id: requestId,
+            retryable: e.shouldRetry === true,
+            cause: String(err?.message || err).slice(0, 300),
+          });
         } else {
           // Status first, then close. Reversing these two calls sent an empty
           // 200 for every failure that resolved inside HEAD_DELAY_MS.

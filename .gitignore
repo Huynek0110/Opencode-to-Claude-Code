@@ -13,6 +13,10 @@ effort.json
 scratch/
 tmp/
 
+# left behind only if mutation-check.mjs is killed mid-edit; it restores from
+# this file on the next run, so it must never be committed
+.mutation-check.bak
+
 # node
 node_modules/
 npm-debug.log*

@@ -27,8 +27,6 @@ node test-sse.mjs
 node test-bridge.mjs
 ```
 
-`node mutation-check.mjs` is deliberately NOT on that list. It breaks bridge.mjs
-on purpose but never contacts a provider - it costs nothing.
 
 Every other `probe-*.mjs` spends money. If you are about to run one, the question
 is not "is it cheap" but "has the user said yes to this specific run".
@@ -45,13 +43,19 @@ anything, and a rate limit then reports itself as a configuration failure.
 ```
 node test-unit.mjs            170 assertions, imports the pure functions
 node test-http.mjs             47 assertions, drives DeferredSSE against a fake response
-node test-mock.mjs            116 assertions, spawns a FAKE opencode serve
+node test-mock.mjs            163 assertions, spawns a FAKE opencode serve
 node --check <file>
+node mutation-check.mjs        breaks bridge.mjs on purpose, restores it, and
+                             requires the suite to catch every break. Costs no
+                             token, but it EDITS bridge.mjs: never run it while
+                             another process is reading that file, and never run
+                             two copies at once. It leaves .mutation-check.bak
+                             behind if killed, and restores from it next run.
 node probe-alias-coverage.mjs  pure functions
 powershell -File .\run-tests.ps1        no -Live: runs only the three above
 ```
 
-The runner prints the real total (333) because it parses each suite's count.
+The runner prints the real total because it parses each suite's count.
 It used to print a hardcoded 281 that stayed wrong while the suites grew — which
 is part of why the prompt going untested went unnoticed. Do not hardcode it again.
 

@@ -58,6 +58,10 @@ const createBodies = [];
 // retry loop is invisible: the client only ever sees the final answer, so a
 // correction that was never sent and a correction that was sent look identical.
 const prompts = [];
+// Number of upcoming session-create calls that must fail. Round 10 found that a
+// failed create used to be cached, so every later request inherited a 500 with
+// no way out short of restarting the bridge.
+let failCreate = 0;
 
 function sseSay(text) {
   return { data: { text } };
@@ -220,6 +224,7 @@ const mockServer = (await import("node:http")).createServer(async (req, res) => 
     if (body.mode) mode = body.mode;
     if (body.narrations !== undefined) narrationsLeft = Number(body.narrations);
     if (body.delayMs !== undefined) delayMs = Number(body.delayMs);
+    if (body.failCreate !== undefined) failCreate = Number(body.failCreate);
     if (body.resetSessions) {
       sessions.clear();
       sessionCounter = 0;
@@ -237,6 +242,10 @@ const mockServer = (await import("node:http")).createServer(async (req, res) => 
   if (p === "/api/session" && req.method === "POST") {
     const body = await readBody(req);
     createBodies.push(body);
+    if (failCreate > 0) {
+      failCreate--;
+      return json(500, { _tag: "InternalServerError", message: "cannot create a session right now" });
+    }
     const id = "ses_mock_" + ++sessionCounter;
     sessions.add(id);
     return json(200, { id, title: "mock" });
@@ -318,6 +327,11 @@ const bridge = spawn(process.execPath, [path.join(HERE, "bridge.mjs")], {
     BRIDGE_LOG: path.join(HERE, "bridge.mock.log"),
     BRIDGE_HEAD_DELAY_MS: "200",
     BRIDGE_TURN_BUDGET_MS: "3000",
+    // Chosen so the ordinary test prompts (~3k tokens) sit well inside it and
+    // a deliberately oversized one lands outside. Without this the per-turn
+    // budget could never fire in any test, which is how the mechanism stayed
+    // green while round 10 showed the whole retry budget was dead in the suite.
+    BRIDGE_TURN_TOKEN_BUDGET: "40000",
     BRIDGE_MAX_ATTEMPTS: "3",
   },
   stdio: ["ignore", "pipe", "pipe"],
@@ -864,6 +878,87 @@ console.log("\n-- a complete tool_use is never reported as max_tokens --");
   ok("stop_reason is tool_use, not max_tokens", r.json?.stop_reason === "tool_use", r.json?.stop_reason);
   const wrote = blocks.find((b) => b.type === "tool_use");
   ok("the input was not cut", (wrote?.input?.content || "").length === 4000, `${(wrote?.input?.content || "").length}`);
+}
+
+console.log("\n-- one session per variant, even under a burst --");
+{
+  // Round 10 measured this: deleting the single-flight fast path took a burst
+  // of six concurrent identical requests from 1 upstream session to 6. Every
+  // one of those is a session the user pays for and quota burns. The existing
+  // test awaited its posts one at a time, so it could never reach this path.
+  await new Promise((r) => setTimeout(r, 6200));
+  // A cached entry checked within LIVENESS_TTL short-circuits before any create,
+  // so the burst would prove nothing without waiting past it. MAX_INFLIGHT is 4,
+  // which is why there are four posts and not five.
+  await control({ mode: "text", resetSessions: true });
+  const before = createBodies.length;
+  const burst = await Promise.all([
+    post({ tools: [READ_TOOL] }),
+    post({ tools: [READ_TOOL] }),
+    post({ tools: [READ_TOOL] }),
+    post({ tools: [READ_TOOL] }),
+  ]);
+  ok("every request in the burst was answered", burst.every((b) => b.status === 200), burst.map((b) => b.status).join(","));
+  const created = createBodies.length - before;
+  ok("four concurrent requests share ONE upstream session", created === 1, `${created} sessions created`);
+}
+
+console.log("\n-- a failed session create is not cached forever --");
+{
+  // The bridge used to write the failed entry back and leave `inflight` pointing
+  // at an already-rejected promise, so every later request returned the same 500
+  // with no way out short of restarting the bridge - exactly what the code
+  // comment above claims was fixed, and nothing tested it.
+  //
+  // failCreate has to exceed the retries the bridge makes inside ONE request, or
+  // the create simply succeeds on the second try and nothing reaches the client.
+  await control({ mode: "text", failCreate: 50, resetSessions: true });
+  await new Promise((r) => setTimeout(r, 6200));
+  const first = await post({ tools: [READ_TOOL] });
+  ok("the failing turn reports the failure", first.status >= 400, String(first.status));
+  await control({ failCreate: 0 });
+  const second = await post({ tools: [READ_TOOL] });
+  ok("the NEXT turn recovers without a restart", second.status === 200, String(second.status));
+  const third = await post({ tools: [READ_TOOL] });
+  ok("and the one after that too", third.status === 200, String(third.status));
+}
+
+console.log("\n-- an over-budget prompt is refused before a token is spent --");
+{
+  // This is the streaming asymmetry round 10 measured: inside the retry loop
+  // this same condition can only be reported once message_start has flushed the
+  // headers, so the client got a 200 and no retry signal. Refused here instead,
+  // where a real status and real headers are still possible.
+  await control({ mode: "text", resetSessions: false });
+  const genBefore = generateCalls;
+  const big = "x".repeat(400000);
+  const r = await post({ tools: [READ_TOOL], messages: [{ role: "user", content: big }] });
+  ok("it is a 503, not a 500", r.status === 503, String(r.status));
+  ok("it is marked retryable", r.headers.get("x-should-retry") === "true", String(r.headers.get("x-should-retry")));
+  ok("it carries retry-after", !!r.headers.get("retry-after"), String(r.headers.get("retry-after")));
+  ok("nothing was sent upstream", generateCalls === genBefore, `${generateCalls - genBefore} generate calls`);
+  ok("and it says the model was never called", /nothing was sent/i.test(r.json?.error?.message || ""), r.json?.error?.message);
+
+  // And the streaming form must agree, which was the whole point.
+  const rs = await post({ tools: [READ_TOOL], stream: true, messages: [{ role: "user", content: big }] });
+  ok("streaming agrees on the status", rs.status === 503, String(rs.status));
+  ok("streaming agrees it is retryable", rs.headers.get("x-should-retry") === "true", String(rs.headers.get("x-should-retry")));
+}
+
+console.log("\n-- a retryable failure mid-stream still says retry --");
+{
+  // Once message_start is out there is no status code to send, so the guidance
+  // has to ride in the error event. It did not, and the non-streaming path did
+  // carry it - same failure, opposite advice to the client.
+  mode = "hang";
+  const r = await post({ tools: [READ_TOOL], stream: true, messages: [{ role: "user", content: "hi" }] });
+  ok("the stream still opened", r.status === 200, String(r.status));
+  const ev = r.events.find((e) => e.name === "error");
+  ok("it ends with an error event", !!ev, JSON.stringify(r.names));
+  const payload = ev ? JSON.parse(ev.data || "{}") : {};
+  ok("the error event says it is retryable", payload.should_retry === true, ev && ev.data);
+  ok("the error event carries a delay", typeof payload.retry_after_ms === "number", ev && ev.data);
+  ok("and no message_stop claims the turn succeeded", !r.names.includes("message_stop"), JSON.stringify(r.names));
 }
 
 console.log("\n-- the prompt contract itself --");

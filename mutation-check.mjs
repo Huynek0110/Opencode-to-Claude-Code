@@ -35,7 +35,20 @@ import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const P = path.join(HERE, "bridge.mjs");
+// A sidecar copy of the pristine file. Signal handlers do not survive kill -9 or
+// a harness-level abort, and this script has already left mutated source on disk
+// once that way. If the sidecar is here at startup, the last run died holding a
+// mutation, and restoring is the only correct action - otherwise the bridge would
+// silently run whatever the dead run left behind.
+const BAK = path.join(HERE, ".mutation-check.bak");
+if (fs.existsSync(BAK)) {
+  fs.copyFileSync(BAK, P);
+  fs.unlinkSync(BAK);
+  console.log("a previous mutation run died mid-edit; bridge.mjs restored from the sidecar.");
+}
+
 const orig = fs.readFileSync(P);
+fs.writeFileSync(BAK, orig);
 const origText = orig.toString("utf8");
 const EOL = origText.includes("\r\n") ? "\r\n" : "\n";
 const norm = (s) => s.replace(/\r\n/g, "\n");
@@ -76,6 +89,22 @@ const MUTATIONS = [
   ["closer: unconditional again",
    'if (tools.length && body.tool_choice?.type !== "none") {',
    "if (true) {"],
+
+  ["session: single-flight fast path removed",
+   "if (entry?.inflight) return entry.inflight;",
+   ""],
+
+  ["session: a failed create is cached forever",
+   "if (sessions.get(key)?.inflight === promise) sessions.delete(key);",
+   ""],
+
+  ["budget: an over-budget prompt is no longer refused before streaming",
+   "  if (TURN_TOKEN_BUDGET > 0 && preflight > TURN_TOKEN_BUDGET) {",
+   "  if (false) {"],
+
+  ["streaming: the error event stops saying retry",
+   "            should_retry: e.shouldRetry === true,",
+   "            should_retry: false,"],
 
   ["protocol: emptied",
    /const RESPONSE_PROTOCOL = `[\s\S]*?`;/,
@@ -173,4 +202,5 @@ if (blind.length) {
   for (const b of blind) console.log("    - " + b);
   process.exit(1);
 }
+fs.unlinkSync(BAK);
 console.log("\n  Every mutation was caught. The suite is not decorative.");
