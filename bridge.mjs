@@ -812,7 +812,7 @@ function renderToolResult(content) {
       // content disappear without trace, which is silent data loss rather than
       // an honest "this block cannot be rendered".
       if (p.type === "image") return "[image omitted]";
-      const json = escapeFence(safeJson(p));
+      const json = safeJson(p);
       return json.length > 400 ? `[${p.type}] ` + json.slice(0, 400) + " ..." : `[${p.type}] ${json}`;
     })
     .join("\n")
@@ -1092,7 +1092,7 @@ function buildTranscript(body) {
     lines.push(
       "FINAL: reply with ONE JSON object and nothing else, of the form\n" +
         '{"text":"<your message>"}\n' +
-        'and no other key. Do not emit a native tool call either; only the JSON object is read.'
+        'and no "tools" key. Do not emit a native tool call either; only the JSON object is read.'
     );
   }
 

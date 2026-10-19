@@ -10,6 +10,34 @@ claude  ──Anthropic POST /v1/messages──▶  bridge.mjs  ──HTTP──
 
 ---
 
+## Model có dùng được tool call không? — **Có, đã đo**
+
+Câu hỏi này là tiêu chí nghiệm thu của cả dự án, và nó đã bị ghi là "chưa chứng minh
+được" suốt nhiều vòng trong khi **bằng chứng nằm ngay trong `bridge.log`**, ở traffic thật
+ngày 2026-10-18:
+
+```
+req_mvegijcm   attempts:2  ms:27603  calls:["Read"]  stop:"tool_use"   rejected:{}
+req_mvegj5lm   attempts:1  ms:15735  calls:["Bash"]  stop:"tool_use"   rejected:{}
+```
+
+Hai lần độc lập, một lần **không cần retry**. `rejected` rỗng ở cả hai — không có gì bị
+xoá, bị đổi tên hay bị vá lại. Cả chuỗi chạy: dựng prompt → mô tả envelope → model tự phát
+`{"tools":[{"name":"Read",...}]}` → bridge parse → validate → đổi thành block `tool_use` →
+`stop_reason: "tool_use"` → HTTP 200.
+
+Không phải mock: mock ghi ra file khác và trả lời trong 18 ms. Hai dòng trên mất **27,6 s**
+và **15,7 s** generation thật.
+
+Claim *"tool call làm xong rồi mà model không dùng"* là **sai**. Model dùng.
+
+**Còn chưa đo:** tỉ lệ (2 thành công không phải là tỉ lệ), case `write`, và quan trọng
+nhất — hai dòng log đó sinh ra dưới protocol **cũ 2044 ký tự**, lúc **06:28 +0700**, còn
+bản **1104 ký tự** hiện tại commit lúc **10:33 +0700**. Prompt đang chạy **chưa từng
+được đo** với model. Chi tiết đầy đủ: [`EVIDENCE-model-toolcall.md`](EVIDENCE-model-toolcall.md).
+
+---
+
 ## Vấn đề gốc
 
 Ba rào cản, tất cả đều đã kiểm chứng bằng API thật:
@@ -114,7 +142,10 @@ Chạy test:
 powershell -ExecutionPolicy Bypass -File ".\run-tests.ps1"
 ```
 
-Mặc định **281 assert, không tốn token nào**: `unit` (146) + `http` (47) + `mock` (88).
+Mặc định **333 assert, không tốn token nào**: `unit` (170) + `http` (47) + `mock` (116).
+Con số này được **parse** từ từng suite, không viết cứng — trước đây nó ghi `281` và sai
+suốt nhiều vòng trong khi suite đã lớn hơn, và chính vì con số ấy đứng yên mà việc prompt
+không có test không ai thấy.
 
 `mock` là suite quan trọng nhất và là suite mới: nó dựng một `opencode serve` giả rồi chạy
 `bridge.mjs` thật (tiến trình con) đối diện với nó. Nhờ vậy test được toàn bộ contract —
@@ -253,10 +284,13 @@ và suite fail vì lý do đó chỉ dạy bạn phớt lờ suite. Dùng `test-
 Đó là route completion thuần — không agent loop, không tool catalog. Không có kênh gọi tool
 nào để model đi qua, nên không có gì để chặn.
 
-### `permissions: deny` **không dùng được**, và đây là phát hiện quan trọng nhất về an toàn
+### `permissions: deny` — **không tái lập được** trên build này
 
-Agent `ccbridge` từng mang `permissions: deny` cho 22 tool. Đo trên server đang chạy, bốn
-session, mỗi cái ~1 token:
+> **Trạng thái: chưa xác minh.** Mục này từng ghi "đã đo" và bây giờ không còn đứng vững.
+> Đọc phần dưới trước khi dùng nó làm cơ sở cho một quyết định an toàn nào.
+
+Agent `ccbridge` từng mang `permissions: deny` cho 22 tool. Lần đo đầu (4 session, mỗi cái
+~1 token) cho:
 
 | Session | Kết quả |
 |---|---|
@@ -265,8 +299,34 @@ session, mỗi cái ~1 token:
 | **bất kỳ** deny rule nào, truyền inline | `503` — free tier từ chối |
 | `agent: "ccbridge"` | `503` — free tier từ chối |
 
-**Deny và free tier loại trừ lẫn nhau.** Bật deny không làm bridge an toàn hơn; nó làm **model
-không dùng được** — đúng điều mà cả dự án này tồn tại để tránh.
+**Vòng 9 đo lại, 6 session, cùng server đang chạy:**
+
+| Session | Kết quả |
+|---|---|
+| chỉ `title` | `200` |
+| `agent: "build"` | `200` |
+| `agent: "explore"` — mang cả `system` **và** rule `*/* deny` | `200` |
+| `*/* deny` inline | `200` |
+| `*/* allow` inline | `200` |
+| agent id bịa ra | `200` |
+
+**Cả sáu đều `200`.** Tạo session không validate agent id và không từ chối deny rule.
+
+Hai cách giải thích, chưa phân giải được:
+
+1. Phép kiểm tra **đã dời** sang bước suy luận (inference) — session tạo được, request đầu
+   tiên mới bị chặn.
+2. Lần đo đầu **đọc nhầm rate limit thành lỗi cấu hình** — đúng cái hỏng mà
+   `start-bridge.ps1` đã được viết lại để tránh.
+
+Chuỗi lỗi của free tier **không có trong `opencode.exe`** (đã tìm 212 MB; `FreeTierError`,
+`free tier`, `can only be used from within` — 0 kết quả). Nó đến từ gateway, không phải
+validation cục bộ. Không có cách nào kiểm tra bằng 0 token.
+
+**Hệ quả:** lập luận "deny rule không gánh chức năng, an toàn là cấu trúc" **chưa còn
+đứng vững**. Nó là loại claim nguy hiểm nhất khi để nguyên: nó biện minh cho một tư thế an
+toàn. Cho tới khi một lượt inference trả lời được, README này nói *chưa xác minh* thay vì
+khẳng định theo cả hai hướng.
 
 Canary test đầu tiên — `shell` chạy lệnh thật, tạo `CANARY.txt` chứa `PWNED` — đo **đúng hiện
 tượng, sai nguyên nhân**: khoá config là `"agent"` thay vì `"agents"`, nên **không rule nào
