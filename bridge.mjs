@@ -428,7 +428,18 @@ function resolveEffort(body, ctx = {}) {
  * into a read of the user's disk. Such a name falls through to `unresolved` and
  * gets named back to the model as illegal, which is the safe outcome.
  */
-const TOOL_ALIASES = {
+/**
+ * An object literal inherits from Object.prototype, so TOOL_ALIASES["constructor"]
+ * returned the Object constructor - truthy, and not iterable. A model guessing one
+ * wrong tool name threw a TypeError out of normalizeEnvelope, which no error rule
+ * matched, turning a recoverable typo into a 500 that killed all three attempts.
+ * Null-prototype maps make the lookup say "not present" instead.
+ */
+function bareMap(src) {
+  return Object.assign(Object.create(null), src);
+}
+
+const TOOL_ALIASES = bareMap({
   // OpenCode's own tool names.
   shell: ["Bash"],
   read: ["Read"],
@@ -489,9 +500,9 @@ const TOOL_ALIASES = {
   // burned a retry. The prompt injection is not a security boundary, and `/generate`
   // having no tool channel is.
   agent: ["Task"],
-};
+});
 
-const INPUT_KEY_MAP = {
+const INPUT_KEY_MAP = bareMap({
   Read: { path: "file_path", filePath: "file_path", file: "file_path" },
   Write: { path: "file_path", filePath: "file_path", file: "file_path" },
   NotebookRead: { path: "notebook_path", filePath: "notebook_path", file: "notebook_path" },
@@ -519,7 +530,7 @@ const INPUT_KEY_MAP = {
     replace_all: "replace_all",
     replaceall: "replace_all",
   },
-};
+});
 
 /**
  * Keys the model adds because `opencode serve` advertises OpenCode's own tool
@@ -532,7 +543,7 @@ const INPUT_KEY_MAP = {
  * specifically: Claude Code runs `Bash` in the session directory anyway, so
  * discarding the field produces the call the model meant instead of an error.
  */
-const DROP_INPUT_KEYS = {
+const DROP_INPUT_KEYS = bareMap({
   Bash: ["workdir", "cwd", "shell"],
   // Claude Code's schemas come from Zod with `io:"output"`, which sets
   // `additionalProperties: false` on EVERY tool object. OpenCode advertises
@@ -542,7 +553,7 @@ const DROP_INPUT_KEYS = {
   // which inverts the sense.
   Glob: ["hidden", "limit"],
   Grep: ["caseSensitive", "literalText", "maxResultsExtra"],
-};
+});
 
 /**
  * Names that cannot be mapped, however they are spelled. The shapes are
@@ -781,16 +792,27 @@ function flattenContent(content) {
   return out;
 }
 
+/**
+ * Tool output is fenced as `<tool_result>...</tool_result>` to keep it from
+ * reading as transcript structure. Anything the model reads can carry the
+ * closing tag itself - a web page, a git log, a grep hit - which walked it out
+ * of the fence and past the warning that the whole block is untrusted. That is
+ * an injection route through the exact boundary built to stop one.
+ */
+function escapeFence(s) {
+  return String(s).replace(/<\/tool_result>/gi, "<\\/tool_result>");
+}
+
 function renderToolResult(content) {
   const parts = flattenContent(content);
   return parts
     .map((p) => {
-      if (p.type === "text") return p.text;
+      if (p.type === "text") return escapeFence(p.text);
       // Anything else still gets shown. Substituting the bare type name made the
       // content disappear without trace, which is silent data loss rather than
       // an honest "this block cannot be rendered".
       if (p.type === "image") return "[image omitted]";
-      const json = safeJson(p);
+      const json = escapeFence(safeJson(p));
       return json.length > 400 ? `[${p.type}] ` + json.slice(0, 400) + " ..." : `[${p.type}] ${json}`;
     })
     .join("\n")
@@ -1047,17 +1069,32 @@ function buildTranscript(body) {
   // function-calling channel" phrasing made the model conclude it could do
   // nothing and refuse outright ("I don't have a runtime available"), which is
   // the one outcome this tail exists to prevent.
-  lines.push(
-    "FINAL: reply with ONE JSON object and nothing else.\n" +
-      "The tools above are fully available. To act, put the call in \"tools\" using the\n" +
-      'exact name from the list: {"tools": [{"name": "<name>", "input": {...}}]}.\n' +
-      "Do not reply that you cannot run anything - you can, through that array.\n" +
-      "Do not emit a native tool call either; only the JSON object is read.\n" +
-      "Most important: do not DESCRIBE what you are about to do. A sentence like\n" +
-      '"Continuing to read the file, and kicking off research in parallel" performs nothing,\n' +
-      "so the turn ends having done no work. Whatever you intend to do belongs in\n" +
-      '"tools" in this reply, not in "text". Use "text" for the finished answer only.'
-  );
+  //
+  // But it was UNCONDITIONAL, which made it contradict itself. With
+  // tool_choice:"none" the prompt held two opposite orders twenty lines apart,
+  // and with no tools at all it claimed they were "fully available". The model
+  // believed the later one, called a tool, and the bridge then deleted every
+  // tool_use. That is a tool call generated and thrown away by the same program.
+  if (tools.length && body.tool_choice?.type !== "none") {
+    lines.push(
+      "FINAL: reply with ONE JSON object and nothing else.\n" +
+        'The tools above are available. To act, put the call in "tools" using the\n' +
+        'exact name from the list: {"tools":[{"name":"Read","input":{"file_path":"a.txt"}}]}.\n' +
+        "Do not reply that you cannot run anything - you can, through that array.\n" +
+        "Do not emit a native tool call either; only the JSON object is read.\n" +
+        "Do not DESCRIBE what you are about to do. A sentence like\n" +
+        '"Continuing to read the file, and kicking off research in parallel" performs nothing,\n' +
+        "so the turn ends having done no work. Whatever you intend to do belongs in\n" +
+        '"tools" in this reply, not in "text". Use "text" for the finished answer only.'
+    );
+  } else {
+    // Same envelope rule, but it must not tell the model to reach for tools.
+    lines.push(
+      "FINAL: reply with ONE JSON object and nothing else, of the form\n" +
+        '{"text":"<your message>"}\n' +
+        'and no "tools" key. Do not emit a native tool call either; only the JSON object is read.'
+    );
+  }
 
   return lines.join("\n");
 }
@@ -1184,7 +1221,12 @@ function extractJson(raw) {
 
 /* -------------------------------------------------------------- envelope */
 
-const ENVELOPE_KEYS = ["tools", "tool_calls", "toolCalls", "calls", "text", "message", "response"];
+const ENVELOPE_KEYS = [
+  "tools", "tool_calls", "toolCalls", "calls", "text", "message", "response",
+  // Shapes a model reaches for when it is emulating native tool calling. Each
+  // was refused outright before, costing three upstream calls and a 400.
+  "content", "tool_uses", "tool_use", "output", "action", "actions",
+];
 
 function normalizeEnvelope(obj, tools) {
   const allowed = tools.map((t) => t.name);
@@ -1412,14 +1454,22 @@ async function runModel(
 
 /* ------------------------------------------------------------- retry loop */
 
+/**
+ * Used only when there is no specific correction to send.
+ *
+ * These must NOT state a cause the bridge has not observed. `retryNote` covers
+ * every case where the model actually replied; this table is reached exactly
+ * when `runModel` threw - a 503, a 429, a timeout - meaning the bridge received
+ * NO reply at all. The old hint claimed the model's tool call had been discarded,
+ * teaching it to look for a rejection that never happened, and the last one
+ * invited a text-only reply - the exact silent no-op this project exists to
+ * eliminate. On a rate-limited free tier a 503 on the first attempt is routine.
+ */
 const RETRY_HINTS = [
   "",
-  `\n\n[CORRECTION] Your previous reply came back EMPTY. It arrived empty because the tool call\n` +
-    `you attempted used a native function-calling channel, which this deployment discards.\n` +
-    `The tools ARE available - call them through the JSON envelope instead:\n` +
-    `{"text":"", "tools":[{"name":"Read","input":{"file_path":"C:\\\\path\\\\to\\\\file"}}]}`,
-  `\n\n[CORRECTION 2] Still no usable reply. Output the JSON envelope now, nothing else.\n` +
-    `If you only want to talk, output {"text":"your message"}.`,
+  "",
+  `\n\n[CORRECTION 2] The bridge could not reach the model on the previous attempts.\n` +
+    `Output the JSON envelope now, nothing else.`,
 ];
 
 /**
@@ -1461,15 +1511,17 @@ const ACT_VERB = "(?:read|reads|check|checks|open|opens|run|runs|look|search|gre
 
 const NARRATION_ACTION = new RegExp(
   [
-    `\\bi'?ll\\s+${ACT_VERB}\\b`,
+    `\\bi(?:'ll| will)\\s+${ACT_VERB}\\b`,
     `\\blet me\\s+${ACT_VERB}\\b`,
     `\\b(?:continuing|proceeding|going|working)\\s+(?:to\\s+|on\\s+)?${ACT_VERB}\\b`,
     `\\bkicking off\\b`,
     `\\bnow i'?ll\\b`,
     `\\bi am going to\\s+${ACT_VERB}\\b`,
     `\\bnext,? i'?ll\\b`,
-    `\\breading the rest\\b`,
-    `\\bthe rest of the (?:file|config|code|project)\\b`,
+    // "reading the rest" and "the rest of the config" are MENTION phrases, not
+    // PROMISE phrases. "Continuing with the rest of the config: the timeout is
+    // 900 seconds" is a finished answer, and it was being turned into a 400
+    // after three paid upstream calls. A promise needs an action verb.
   ].join("|"),
   "i"
 );
@@ -1490,11 +1542,18 @@ function looksLikeNarration(text) {
   const lower = head.toLowerCase();
   const colonAt = head.indexOf(":");
   const sentenceEnd = head.search(/[.!?]\s/);
-  const boundary = colonAt >= 0 ? colonAt : sentenceEnd;
+  const boundary = colonAt >= 0 && (sentenceEnd < 0 || colonAt < sentenceEnd) ? colonAt : sentenceEnd;
   if (boundary >= 0 && boundary < 160) {
     const clause = lower.slice(0, boundary);
     // "Okay, here is the summary:" is an announcement plus content. Keep it.
     if (/\b(summary|summar|here (is|are)|i found|found|results?|list of|answer|report|breakdown|overview)\b/.test(clause)) {
+      return false;
+    }
+    // The content usually sits AFTER the colon. Checking only the pre-colon
+    // clause meant "Continuing with the rest of the config: the timeout is 900
+    // seconds" was classified as narration and thrown away.
+    const after = lower.slice(boundary);
+    if (/\b(here (is|are)|what i found|i found|means|is set to|shows|contains|reads|timeout|port|seconds|lines)\b/.test(after)) {
       return false;
     }
   }
@@ -1520,11 +1579,21 @@ function correctionFor(kind, detail, allowed) {
     );
   }
   if (kind === "names") {
+    // A list of every offered tool runs to hundreds of entries once MCP servers
+    // are attached, injected into a turn whose token budget is already spent.
+    const shown = allowed.slice(0, 40).join(", ");
+    const more = allowed.length > 40 ? ` (and ${allowed.length - 40} more)` : "";
+    // Only suggest the rename when the caller actually offers those names. With
+    // allowed = [Read, Write, Grep] the old wording told the model to use Bash,
+    // which cannot exist here.
+    const remap = ["Bash", "Read", "Write", "Edit"].some((n) => allowed.includes(n))
+      ? "Note that shell/read/write/edit are NOT names here - use Bash/Read/Write/Edit.\n"
+      : "";
     return (
       `\n\n[CORRECTION] You called a tool that does not exist here: ${detail.join("; ")}.\n` +
-      `The only tool names available are: ${names}.\n` +
-      `Copy the name EXACTLY from that list. Note that shell/read/write/edit are NOT names\n` +
-      `here - use Bash/Read/Write/Edit.`
+      `The only tool names available are: ${shown}${more}.\n` +
+      `Copy the name EXACTLY from that list.` +
+      remap
     );
   }
   if (kind === "shape") {
@@ -1864,7 +1933,14 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
               : r.badInput?.length
                 ? "schema"
                 : null;
-      const detail = kind ? (r.unknownName || r.badShape || r.badInput || []).slice(0, 4) : [];
+      // An EMPTY ARRAY IS TRUTHY. `r.unknownName || r.badShape || ...` therefore
+      // returned the first array every time, so `detail` was always `[]` and the
+      // model was told "your arguments did not satisfy the tool schema: ." with
+      // nothing after the colon. Three retries repeating the same empty hint is
+      // how a recoverable schema mistake became a dead turn.
+      const detail = kind
+        ? (r.unknownName.length ? r.unknownName : r.badShape.length ? r.badShape : r.badInput).slice(0, 4)
+        : [];
       // An unmet hard tool_choice is a failure in its own right, even when the
       // envelope is perfectly valid text. With `type:"tool"` the NAMED tool
       // counts: calling a different one satisfied `parsed.tools.length` and so
@@ -1888,7 +1964,7 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
             logRequest("budget", { id: requestId, attempt, tokens_spent: tokensSpent });
           } else {
             retryNote = needsTool
-              ? correctionFor("needstool", [], allowed)
+              ? correctionFor("needstool", [], forcedName ? [forcedName] : allowed)
               : correctionFor(kind, detail, allowed);
             continue;
           }
@@ -2002,10 +2078,14 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
     // client asks for serialised tools and got parallel ones back. It means at
     // most ONE tool call, not "one of each kind".
     if (body.tool_choice?.disable_parallel_tool_use) {
+      // Keep the FIRST call, not the last. Walking backwards silently kept `c`
+      // and dropped `a` and `b`, so a model that asked for three things had two
+      // of them discarded with nothing reported - to the client or to the model
+      // on the next turn. Anthropic serialises from the front.
       let keptOne = false;
-      for (let i = content.length - 1; i >= 0; i--) {
+      for (let i = 0; i < content.length; i++) {
         if (content[i].type !== "tool_use") continue;
-        if (keptOne) content.splice(i, 1);
+        if (keptOne) content.splice(i--, 1);
         else keptOne = true;
       }
     }

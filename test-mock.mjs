@@ -598,6 +598,42 @@ console.log("\n-- abuse resistance --");
   ok("an empty object counts as zero", emptyObj.status === 200, String(emptyObj.status));
 }
 
+console.log("\n-- the closer must not contradict the request --");
+{
+  // The closer was unconditional and sat AFTER tool_choice lines, so with
+  // tool_choice "none" the prompt held two opposite orders twenty lines apart.
+  // The model believed the later one, called a tool, and the bridge deleted it.
+  // That is a tool call generated and thrown away by the same program.
+  const { buildTranscript } = await import("./bridge.mjs");
+  const none = buildTranscript({
+    tools: [READ_TOOL],
+    tool_choice: { type: "none" },
+    messages: [{ role: "user", content: "hi" }],
+  });
+  ok("tool_choice none tells the model not to use tools", /no "tools" key/.test(none), none.slice(-160));
+  ok("tool_choice none never says the tools are available", !/tools above are available/i.test(none));
+
+  const some = buildTranscript({ tools: [READ_TOOL], messages: [{ role: "user", content: "hi" }] });
+  ok("with tools the closer does point at them", /tools above are available/i.test(some));
+
+  const noneTools = buildTranscript({ tools: [], messages: [{ role: "user", content: "hi" }] });
+  ok("with no tools offered the closer does not offer any", !/tools above are available/i.test(noneTools));
+  ok("with no tools the closer forbids the tools key", /no "tools" key/.test(noneTools));
+
+  // An example the model might copy verbatim must itself be valid JSON. The old
+  // examples used {...}, which JSON.parse rejects and the span scan cannot save.
+  ok("the closer's example is valid JSON", (() => {
+    const m = some.match(/\{"tools":\[[^\]]*\]\}/);
+    if (!m) return false;
+    try {
+      JSON.parse(m[0]);
+      return true;
+    } catch {
+      return false;
+    }
+  })());
+}
+
 console.log("\n-- the session must stay usable --");
 {
   // A session carrying any deny rule is refused outright by the free tier, so

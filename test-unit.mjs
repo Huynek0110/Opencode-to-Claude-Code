@@ -217,6 +217,44 @@ function eq(name, actual, expected) {
     lens.join(","));
 }
 
+/* ---------------------------------------------- prototype keys are inert */
+{
+  // TOOL_ALIASES is a bare object literal, so ["constructor"] used to return the
+  // Object constructor: truthy, not iterable, and a TypeError thrown out of
+  // normalizeEnvelope matched no error rule, becoming a 500 that killed all three
+  // attempts of a turn. One wrong tool name from the model was enough.
+  eq("constructor does not resolve", resolveToolName("constructor", ["Read", "Bash"]), null);
+  eq("toString does not resolve", resolveToolName("toString", ["Read"]), null);
+  eq("__proto__ does not resolve", resolveToolName("__proto__", ["Read"]), null);
+  eq("valueOf does not resolve", resolveToolName("valueOf", ["Read"]), null);
+  // A real name that happens to look inherited must still work.
+  eq("a genuine name still resolves", resolveToolName("read", ["Read"]), "Read");
+}
+
+/* ----------------------------------------------------- narration negatives */
+{
+  // The removed triggers were MENTION phrases, not PROMISE phrases. Each of
+  // these is a finished answer that used to become a 400 after three paid calls.
+  const finished = [
+    "Continuing with the rest of the config: the timeout is 900 seconds and the port is 8787.",
+    "Working on the rest of the code: here are the findings.",
+    "I have reviewed it; the rest of the file has no tests.",
+    "Sure, let me summarize what I found in the config file: effort is set to high and the port is 8787.",
+    "Okay, here is the summary you asked for. The file contains 42 lines.",
+  ];
+  for (const t of finished) eq(`finished answer survives: ${t.slice(0, 44)}`, looksLikeNarration(t), false);
+
+  // And the promises must still be caught, in both spellings.
+  const promises = [
+    "Okay, continuing to read the rest of bridge.mjs, and kicking off research in parallel.",
+    "I'll read the file for you.",
+    "I will read the file for you.",
+    "Let me check the rest of the config now.",
+    "Continuing to read the rest of the file.",
+  ];
+  for (const t of promises) eq(`promise detected: ${t.slice(0, 44)}`, looksLikeNarration(t), true);
+}
+
 /* ------------------------------------------------- per-turn token budget */
 {
   // A retry re-sends the whole prompt. The budget has to stop the next attempt
@@ -409,7 +447,13 @@ function eq(name, actual, expected) {
   eq("plain text reply recognized", normalizeEnvelope({ text: "hi" }, tools).recognized, true);
   eq("tools-only recognized", normalizeEnvelope({ tools: [] }, tools).recognized, true);
   eq("unknown shape NOT recognized", normalizeEnvelope({ answer: 42 }, tools).recognized, false);
-  eq("content key NOT recognized", normalizeEnvelope({ content: "42" }, tools).recognized, false);
+  // `content` used to be refused, so a model emitting the Anthropic-native shape
+  // `{"content":[{"type":"tool_use",...}]}` paid three upstream calls and a 400
+  // for something the bridge could have read. A genuinely foreign object is
+  // still refused.
+  eq("content key IS recognized", normalizeEnvelope({ content: "42" }, tools).recognized, true);
+  eq("tool_uses key IS recognized", normalizeEnvelope({ tool_uses: [] }, tools).recognized, true);
+  eq("a foreign object is still refused", normalizeEnvelope({ foo: 1, bar: 2 }, tools).recognized, false);
   eq("unparsed input not recognized", normalizeEnvelope(null, tools).recognized, false);
 
   // subagent must not become Task: OpenCode's injected prompt pushes it, and
