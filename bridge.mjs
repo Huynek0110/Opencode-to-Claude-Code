@@ -867,6 +867,20 @@ function countLines(s) {
   return n;
 }
 
+/**
+ * The `# REQUIRED THIS TURN` / `# FORBIDDEN THIS TURN` block.
+ *
+ * `allowed` is the list of tool names the caller actually offered, and it is not
+ * decoration here. When `tool_choice` names a tool that was never offered, the
+ * old code still emitted "the harness REQUIRES you to call exactly one tool:
+ * Read" into a turn that offered no tools at all - two opposite orders, the
+ * same shape of contradiction the FINAL closer used to produce, and it killed
+ * every attempt because nothing the model could name would ever resolve.
+ *
+ * So a forced tool that is not on offer produces no forced-tool block. The turn
+ * cannot satisfy the requirement, and saying so in prose would only spend three
+ * paid attempts proving it.
+ */
 function toolChoiceLines(choice, allowed) {
   if (!choice || typeof choice !== "object") return [];
   if (choice.type === "any") {
@@ -877,6 +891,10 @@ function toolChoiceLines(choice, allowed) {
     ];
   }
   if (choice.type === "tool" && choice.name) {
+    // A forced tool the caller never offered cannot be satisfied. Emitting the
+    // requirement anyway spends three attempts proving it, and contradicts the
+    // closer, which by this point is correctly saying there are no tools to use.
+    if (!allowed.includes(choice.name)) return [];
     return [
       "",
       `# REQUIRED THIS TURN\nThe harness REQUIRES you to call exactly one tool: "${choice.name}".\n` +
@@ -2165,10 +2183,19 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
     };
     const u = usageBlock(usage);
 
-    // `max_tokens` wins over `tool_use`: if the budget ran out the turn really
-    // was truncated, and reporting tool_use would tell the client it has a
-    // complete tool call to act on.
-    const stopReason = truncated ? "max_tokens" : hasTool ? "tool_use" : "end_turn";
+    // A complete tool_use wins over `truncated`.
+    //
+    // The two are independent, and conflating them lies to the client in the
+    // expensive direction. `truncated` is set when the budget runs out, but the
+    // code above deliberately KEEPS an oversized tool_use whole and drops the
+    // text instead - so a turn can be flagged truncated while carrying a
+    // perfectly complete Write. Reporting max_tokens then tells Claude Code the
+    // output is unfinished, and it declines to run a tool call that is fine.
+    //
+    // This was claimed as fixed in 689100b and was not. The commit message said
+    // "stop_reason no longer pairs max_tokens with a complete tool_use" while the
+    // line below still put truncated first.
+    const stopReason = hasTool ? "tool_use" : truncated ? "max_tokens" : "end_turn";
 
     logRequest("done", {
       id: requestId,

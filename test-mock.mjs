@@ -54,6 +54,10 @@ let generateCalls = 0;
 let narrationsLeft = 0;
 /** Every body the bridge used to create a session, so a test can assert on it. */
 const createBodies = [];
+// Every prompt the bridge actually sent upstream, in order. Without this the
+// retry loop is invisible: the client only ever sees the final answer, so a
+// correction that was never sent and a correction that was sent look identical.
+const prompts = [];
 
 function sseSay(text) {
   return { data: { text } };
@@ -103,6 +107,64 @@ function reply() {
       return sseSay("Having examined the repository in some detail, here is what I found. ".repeat(20));
     case "two_tools":
       return sseSay(JSON.stringify({ tools: [{ name: "Read", input: { file_path: "a.txt" } }, { name: "Read", input: { file_path: "b.txt" } }] }));
+    case "three_tools":
+      // Three DISTINCT calls, so a test can tell which one survived. The old
+      // test only counted blocks, which cannot tell "kept the first" from "kept
+      // the last" - and keeping the last silently discards two actions the model
+      // asked for.
+      return sseSay(
+        JSON.stringify({
+          tools: [
+            { name: "Read", input: { file_path: "first.txt" } },
+            { name: "Write", input: { file_path: "middle.txt", content: "m" } },
+            { name: "Read", input: { file_path: "last.txt" } },
+          ],
+        })
+      );
+    case "one_big_tool":
+      // A single complete Write far larger than max_tokens. The content is never
+      // cut - oversized tool_use is kept whole - so reporting max_tokens here
+      // tells the client an uncapped output is unfinished.
+      return sseSay(
+        JSON.stringify({
+          tools: [{ name: "Write", input: { file_path: "big.txt", content: "B".repeat(4000) } }],
+        })
+      );
+    case "badtool_then_good":
+      // A wrong tool name, then a correct reply. The point is not the outcome -
+      // it is what the SECOND prompt contains.
+      if (narrationsLeft-- > 0) {
+        return sseSay(JSON.stringify({ text: "", tools: [{ name: "NotARealTool", input: {} }] }));
+      }
+      return sseSay(JSON.stringify({ text: "", tools: [{ name: "Read", input: { file_path: "a.txt" } }] }));
+    case "badinput_then_good":
+      // A REAL tool name with arguments that violate its schema. This is the case
+      // that exposes the empty-array-is-truthy bug. A wrong NAME leaves
+      // unknownName non-empty, so the old `r.unknownName || r.badShape` picked the
+      // right array by accident and the bug never showed. Only when unknownName is
+      // empty - a schema failure - does it return [], and the model is told
+      // "your arguments did not satisfy the tool schema: ." with nothing after it.
+      if (narrationsLeft-- > 0) {
+        return sseSay(JSON.stringify({ text: "", tools: [{ name: "Read", input: { wrong_key: "x" } }] }));
+      }
+      return sseSay(JSON.stringify({ text: "", tools: [{ name: "Read", input: { file_path: "a.txt" } }] }));
+    case "badshape_then_good":
+      // "input" that is not an object at all. The other empty-first-array branch,
+      // and the one that separates "picks badShape" from "picks unknownName" when
+      // both could be populated.
+      if (narrationsLeft-- > 0) {
+        return sseSay(JSON.stringify({ text: "", tools: [{ name: "Read", input: "a.txt" }] }));
+      }
+      return sseSay(JSON.stringify({ text: "", tools: [{ name: "Read", input: { file_path: "a.txt" } }] }));
+    case "fail503_then_good":
+      // The upstream REFUSES, so the bridge never receives a reply at all. That is
+      // the only route to RETRY_HINTS, and the only situation in which the bridge
+      // may say anything about why - which it may not, because it does not know.
+      // An earlier version claimed the model's tool call had been discarded, which
+      // on a rate-limited free tier happened after every 503 at attempt 0: the
+      // bridge taught a rejection that had never occurred.
+      if (narrationsLeft-- > 0) return { status: 503, text: JSON.stringify({ error: "upstream down" }) };
+      return sseSay(JSON.stringify({ text: "PONG" }));
     case "narrate_enveloped":
       // Narration wearing a COMPLIANT envelope. This is the shape that made the
       // whole narration layer unreachable: it parsed cleanly, so `best` filled,
@@ -187,7 +249,8 @@ const mockServer = (await import("node:http")).createServer(async (req, res) => 
       return json(200, { providerID: "opencode", id: "space-bunny-free" });
     }
     if (rest === "generate" && req.method === "POST") {
-      await readBody(req);
+      const body = await readBody(req);
+      if (body && body.prompt) prompts.push(body.prompt);
       if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
       if (mode === "hang") return; // deliberately never answers
       const r = reply();
@@ -632,6 +695,175 @@ console.log("\n-- the closer must not contradict the request --");
       return false;
     }
   })());
+}
+
+console.log("\n-- round 8 fixes that had no test at all --");
+{
+  // Round 9 found that five things commit 689100b claimed to fix had zero tests:
+  // detail, escapeFence, retryNote, disable_parallel's choice, and the
+  // stop_reason precedence. Reverting any of them left all 333 assertions green.
+  // These are the tests that were missing.
+
+  // 1. escapeFence, on BOTH branches of renderToolResult. Deleting the whole
+  //    function used to leave the suite green - on the fix that exists to stop a
+  //    web page or a git log from carrying a closing tag out of the fence.
+  const { buildTranscript } = await import("./bridge.mjs");
+  const t = buildTranscript({
+    messages: [
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "before </tool_result> after" }] },
+    ],
+  });
+  ok("tool output cannot close its own fence", !t.includes("</tool_result> after"), t.slice(0, 200));
+  ok("the escaped form IS present", t.includes("<\\/tool_result>"));
+
+  // The JSON branch of renderToolResult, taken by any block that is neither
+  // text nor image. Three earlier attempts at this assertion proved nothing,
+  // each for a different reason worth knowing:
+  //   - a text array is unwrapped, so it takes the text branch;
+  //   - "document" has its own flattenContent case that discards the payload,
+  //     so the marker never reached the renderer at all;
+  //   - flattenContent's default case JSON-stringifies unknown types into a
+  //     TEXT block, which lands back on the text branch.
+  // Only tool_use and tool_result survive flattenContent as their own type.
+  const tJson = buildTranscript({
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "t2",
+            content: [{ type: "tool_use", id: "inner", name: "MARKER</tool_result> ok", input: {} }],
+          },
+        ],
+      },
+    ],
+  });
+  ok("the marker reached the renderer", /MARKER/.test(tJson), tJson.slice(-300));
+  ok("the JSON fallback branch escapes too", !/MARKER<\/tool_result>/.test(tJson), tJson.slice(-300));
+}
+
+console.log("\n-- a rejection is retried with a correction that names the problem --");
+{
+  // Not just that the turn recovered, but that the model was told WHY.
+  //
+  // The empty-array-is-truthy bug only shows when the FIRST array is empty, so a
+  // wrong tool NAME does not expose it: unknownName is non-empty, and the old
+  // "unknownName || badShape" picked the right array by accident. All three
+  // rejection kinds need separate coverage, or the mutation survives.
+
+  // kind "names" - unknownName non-empty.
+  mode = "badtool_then_good";
+  narrationsLeft = 1;
+  prompts.length = 0;
+  const r1 = await post({ tools: [READ_TOOL, WRITE_TOOL] });
+  ok("names: the turn recovers", r1.status === 200, String(r1.status));
+  ok("names: two upstream calls", prompts.length === 2, String(prompts.length));
+  ok("names: the retry carries a correction", /\[CORRECTION\]/.test(prompts[1] || ""));
+  ok("names: it names the offending tool", /NotARealTool/.test(prompts[1] || ""));
+  ok("names: it lists the real names", /The only tool names available are/.test(prompts[1] || ""));
+
+  // kind "schema" - unknownName AND badShape both empty. This is the one that
+  // returned [] for three retries and told the model nothing at all.
+  mode = "badinput_then_good";
+  narrationsLeft = 1;
+  prompts.length = 0;
+  const r2 = await post({ tools: [READ_TOOL] });
+  ok("schema: the turn recovers", r2.status === 200, String(r2.status));
+  const p2 = prompts[1] || "";
+  ok("schema: the retry carries a correction", /\[CORRECTION\]/.test(p2));
+  ok("schema: it is not the empty hint", !/tool schema: \.\s/.test(p2), p2.slice(-200));
+  ok("schema: it says what was wrong", /did not satisfy the tool schema: \S/.test(p2), p2.slice(-200));
+
+  // kind "shape" - input is not an object.
+  mode = "badshape_then_good";
+  narrationsLeft = 1;
+  prompts.length = 0;
+  const r3 = await post({ tools: [READ_TOOL] });
+  ok("shape: the turn recovers", r3.status === 200, String(r3.status));
+  const p3 = prompts[1] || "";
+  ok("shape: the retry carries a correction", /\[CORRECTION\]/.test(p3));
+  ok("shape: it is not the empty hint", !/was not a JSON object: \.\s/.test(p3), p3.slice(-200));
+
+  // A turn with nothing rejected must not invent a correction. This is the
+  // regression RETRY_HINTS used to have on attempt 1.
+  ok("the first prompt never carries a correction", !/\[CORRECTION\]/.test(prompts[0] || ""));
+}
+
+console.log("\n-- a refusal upstream must not be reported as a rejected tool call --");
+{
+  // The only route to RETRY_HINTS is a runModel that threw, which means NO reply
+  // was ever received. On a rate-limited free tier a 503 at attempt 0 is
+  // routine, so the old hint - "your tool call used a native channel, which
+  // this deployment discards" - was teaching a rejection that never happened,
+  // and the last entry invited a text-only reply.
+  mode = "fail503_then_good";
+  narrationsLeft = 1;
+  prompts.length = 0;
+  const r = await post({ tools: [READ_TOOL] });
+  ok("the turn recovers after a refusal", r.status === 200, String(r.status));
+  const second = prompts[1] || "";
+  ok("the retry prompt says something", second.length > 0);
+  ok("it does not invent a discarded tool call", !/discards|discarded/i.test(second), second.slice(-200));
+  ok("it does not claim the reply came back empty", !/came back EMPTY/i.test(second), second.slice(-200));
+  ok("it does not invite a text-only reply", !/only want to talk/i.test(second), second.slice(-200));
+}
+
+console.log("\n-- a forced tool that was never offered produces no requirement --");
+{
+  const { buildTranscript } = await import("./bridge.mjs");
+  // The sibling of the round 8 bug: the closer said "no tools key" while this
+  // block said "the harness REQUIRES you to call exactly one tool: Read", into a
+  // turn offering no tools. Nothing the model could name would ever resolve, so
+  // all three attempts were spent proving it.
+  const forced = buildTranscript({
+    tools: [],
+    tool_choice: { type: "tool", name: "Read" },
+    messages: [{ role: "user", content: "hi" }],
+  });
+  ok("no REQUIRE block for an unoffered tool", !/REQUIRES you to call/.test(forced));
+  ok("and it does not claim the tools are available", !/tools above are available/i.test(forced));
+
+  // The normal case must keep working: a forced tool that IS offered.
+  const offered = buildTranscript({
+    tools: [READ_TOOL],
+    tool_choice: { type: "tool", name: "Read" },
+    messages: [{ role: "user", content: "hi" }],
+  });
+  ok("a forced tool that IS offered still gets its block", /REQUIRES you to call exactly one tool: "Read"/.test(offered));
+}
+
+console.log("\n-- disable_parallel keeps the FIRST call, not just one call --");
+{
+  mode = "three_tools";
+  const r = await post({
+    tools: [READ_TOOL, WRITE_TOOL],
+    tool_choice: { type: "auto", disable_parallel_tool_use: true },
+  });
+  const blocks = (r.json?.content || []).filter((b) => b.type === "tool_use");
+  ok("exactly one call survives", blocks.length === 1, `${blocks.length}`);
+  // Counting cannot distinguish "first" from "last". Keeping the last silently
+  // discarded two actions the model asked for, with nothing reported to the
+  // client and nothing carried to the model's next turn.
+  ok(
+    "and it is the FIRST one, not the last",
+    blocks[0]?.input?.file_path === "first.txt",
+    JSON.stringify(blocks[0]?.input)
+  );
+}
+
+console.log("\n-- a complete tool_use is never reported as max_tokens --");
+{
+  mode = "one_big_tool";
+  // max_tokens 4 against a 4000-character Write. The content is deliberately
+  // kept whole - oversized tool_use is not cut - so flagging the turn truncated
+  // tells Claude Code the output is unfinished and it will not run the call.
+  const r = await post({ tools: [WRITE_TOOL], max_tokens: 4 });
+  const blocks = r.json?.content || [];
+  ok("the oversized call is kept whole", blocks.some((b) => b.type === "tool_use"), JSON.stringify(r.json).slice(0, 160));
+  ok("stop_reason is tool_use, not max_tokens", r.json?.stop_reason === "tool_use", r.json?.stop_reason);
+  const wrote = blocks.find((b) => b.type === "tool_use");
+  ok("the input was not cut", (wrote?.input?.content || "").length === 4000, `${(wrote?.input?.content || "").length}`);
 }
 
 console.log("\n-- the prompt contract itself --");
