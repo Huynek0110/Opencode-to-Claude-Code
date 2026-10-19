@@ -25,6 +25,15 @@ param(
   [string[]]$LiveCount = @("effort", "load", "protocol", "bridge")
 )
 
+# A second, explicit gate. `-Live` alone has been enough for an automated agent to
+# run every model-backed suite without thinking about it, and each of those calls
+# a provider on a free tier that is already throttled. The env var has to be set
+# deliberately, so the default answer to "should this spend tokens?" is no.
+if ($Live -and -not $env:BRIDGE_ALLOW_LIVE_TESTS) {
+  Write-Error "-Live is refused unless BRIDGE_ALLOW_LIVE_TESTS=1 is set in the environment.`nThese suites call the real model. A single turn can cost tens of thousands of tokens and the free tier is rate limited.`nIf you mean it:`n    `$env:BRIDGE_ALLOW_LIVE_TESTS=1; .\run-tests.ps1 -Live"
+  exit 1
+}
+
 $ErrorActionPreference = "Continue"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root

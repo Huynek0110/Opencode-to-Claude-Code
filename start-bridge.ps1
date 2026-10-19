@@ -43,7 +43,10 @@ param(
   [ValidateSet("", "low", "medium", "high", "xhigh", "max")]
   [string]$Effort = "",
   [ValidateSet("", "low", "medium", "high", "xhigh", "max")]
-  [string]$AuxEffort = ""
+  [string]$AuxEffort = "",
+  # Skip the live completion probe, which is the one part of this script that
+  # costs tokens. Health still reports, but the model path is then unverified.
+  [switch]$NoProbe
 )
 
 $ErrorActionPreference = "Stop"
@@ -154,6 +157,19 @@ if (-not $startedAnything) {
   Write-Host "[skip] everything was already running; not spending a token on a probe"
   Write-Host ""
   Write-Host "Ready. Launch Claude Code with:  claude"
+  return
+}
+
+# The probe below is a real completion. Starting something therefore costs
+# tokens, and the free tier is rate limited - which then reports itself as a
+# configuration failure and sends whoever ran this into a config file that is
+# already correct. Two gates, both needing a deliberate choice: -NoProbe, or the
+# environment variable.
+if ($NoProbe -or $env:BRIDGE_ALLOW_LIVE_TESTS) {
+  Write-Host "[skip] live completion probe disabled (it costs tokens)"
+  Write-Host ""
+  Write-Host "Ready. Launch Claude Code with:  claude"
+  Write-Host "Note: the model path was NOT verified. /health only reads local state."
   return
 }
 
