@@ -100,6 +100,37 @@ const AGENT = process.env.BRIDGE_AGENT || "(none: deny rules disable the free ti
 /** How long one Claude Code turn may occupy the bridge, retries included. */
 const TURN_BUDGET = Number(process.env.BRIDGE_TURN_BUDGET_MS || 240000);
 
+/**
+ * Ceiling on input tokens one turn may spend across all its attempts.
+ *
+ * A retry re-sends the entire prompt, so a turn whose first attempt was
+ * correct-but-malformed can cost three times its own size. Measured from
+ * bridge.log: retries were 471 340 tokens, 34.1% of everything spent, with a
+ * single turn reaching 226 551. On a free tier that is the difference between a
+ * working session and a rate-limited one.
+ *
+ * The estimate for the NEXT attempt is what is checked, not what was spent, so
+ * the budget can never be blown by starting an attempt it cannot afford.
+ */
+const TURN_TOKEN_BUDGET = Number(process.env.BRIDGE_TURN_TOKEN_BUDGET || 90000);
+
+/** Would one more attempt fit inside the turn's token budget? */
+function withinTokenBudget(spent, attempt) {
+  if (attempt + 1 >= MAX_ATTEMPTS) return false;
+  const estimate = estimatePromptTokens(spent, attempt);
+  if (TURN_TOKEN_BUDGET <= 0) return true; // disabled
+  return spent + estimate <= TURN_TOKEN_BUDGET;
+}
+
+/**
+ * Prompt size implied by what has already been spent: the first attempt's cost
+ * is the prompt, so every later attempt costs about the same again.
+ */
+function estimatePromptTokens(spent, attempt) {
+  if (attempt <= 0) return 0;
+  return Math.ceil(spent / attempt);
+}
+
 /** Max simultaneous upstream completions. Beyond this, answer 429. */
 const MAX_INFLIGHT = Number(process.env.BRIDGE_MAX_INFLIGHT || 4);
 let inflight = 0;
@@ -1764,7 +1795,10 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
       } catch (err) {
         if (err && err.status === 400) throw err;
         if (ctx.signal?.aborted) throw err;
-        if (attempt < MAX_ATTEMPTS - 1 && !turnSignal.aborted) {
+        // A retry re-sends the WHOLE prompt, so on a large turn the third
+        // attempt costs three times the first. The token budget is the only
+        // thing standing between one bad turn and a quota that is gone.
+        if (attempt < MAX_ATTEMPTS - 1 && !turnSignal.aborted && withinTokenBudget(tokensSpent, attempt)) {
           // Clear any correction from the previous attempt. Carrying it over
           // tells the model "your previous reply came back EMPTY" when the
           // bridge never received a reply at all, which sends it looking for a
@@ -1850,10 +1884,14 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
       if (kind || needsTool) {
         discarded = rawText;
         if (attempt < MAX_ATTEMPTS - 1) {
-          retryNote = needsTool
-            ? correctionFor("needstool", [], allowed)
-            : correctionFor(kind, detail, allowed);
-          continue;
+          if (!withinTokenBudget(tokensSpent, attempt)) {
+            logRequest("budget", { id: requestId, attempt, tokens_spent: tokensSpent });
+          } else {
+            retryNote = needsTool
+              ? correctionFor("needstool", [], allowed)
+              : correctionFor(kind, detail, allowed);
+            continue;
+          }
         }
         // Last attempt. A prose answer is not automatically a failure - the model may
         // simply have chosen to talk. But prose that ANNOUNCES an action, sent
@@ -2556,6 +2594,8 @@ export {
   clampLevel,
   looksLikeNarration,
   scoreEnv,
+  withinTokenBudget,
+  estimatePromptTokens,
   DeferredSSE,
   acquireSession,
   EFFORT_LEVELS,

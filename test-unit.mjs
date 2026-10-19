@@ -19,6 +19,8 @@ import {
   clampLevel,
   looksLikeNarration,
   scoreEnv,
+  withinTokenBudget,
+  estimatePromptTokens,
   EFFORT_LEVELS,
   MODEL_LIMITS,
 } from "./bridge.mjs";
@@ -213,6 +215,25 @@ function eq(name, actual, expected) {
   );
   ok("budget is granted newest-first, so earlier kept results shrink first", lens[6] > 0 || lens[7] > 20000,
     lens.join(","));
+}
+
+/* ------------------------------------------------- per-turn token budget */
+{
+  // A retry re-sends the whole prompt. The budget has to stop the next attempt
+  // BEFORE it is sent, using an estimate of what it will cost.
+  eq("estimate of attempt 1 is the prompt itself", estimatePromptTokens(40000, 1), 40000);
+  eq("estimate of attempt 2 is the average", estimatePromptTokens(80000, 2), 40000);
+  eq("no estimate before the first attempt", estimatePromptTokens(0, 0), 0);
+
+  // Budget 90000: a 40k prompt affords two attempts (40k + 40k = 80k) but not a
+  // third (120k).
+  ok("second attempt fits a 40k prompt", withinTokenBudget(40000, 1) === true);
+  ok("second attempt does not fit a 60k prompt", withinTokenBudget(60000, 1) === false);
+  // MAX_ATTEMPTS is 3, so attempt 2 is the last one. Asking about "one more"
+  // there is always no, whatever the budget says - the helper must not appear
+  // to allow a fourth attempt.
+  ok("the last attempt is never followed by another", withinTokenBudget(0, 2) === false);
+  ok("a spent budget stops the retry early", withinTokenBudget(89000, 1) === false);
 }
 
 /* ------------------------------------------------ MCP collision guard */
