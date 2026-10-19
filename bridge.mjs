@@ -148,6 +148,9 @@ function logRequest(kind, data) {
   } catch {}
 }
 
+/** Where the per-request id is stashed on the response for later error logging. */
+const REQUEST_ID = Symbol("bridgeRequestId");
+
 function safeJson(v) {
   try {
     return JSON.stringify(v) ?? String(v);
@@ -443,14 +446,17 @@ const TOOL_ALIASES = {
   dir: ["LS", "Glob", "Bash"],
   multiedit: ["Edit"],
   strreplace: ["Edit"],
-  websearch: ["WebSearch"],
   notebook: ["NotebookEdit"],
 
-  // `subagent` is deliberately absent. OpenCode's injected system prompt
-  // actively tells the model to spawn subagents, and Claude Code's Task tool
-  // runs agents in the background by default - aliasing would turn a prompt the
-  // user cannot see into real background agents. `agent` and `task` are genuine
-  // model-side names for that tool and are kept.
+  // All three of `task`, `agent` and `subagent` route to Claude Code's Task.
+  // An earlier version refused `subagent` on the grounds that it would spawn
+  // background agents. But OpenCode's own tool description says "The subagent
+  // tool takes agent instead of subagent_type", so it is advertising the name -
+  // and the bridge does not execute anything. What the bridge emits is a
+  // tool_use that CLAUDE CODE runs, under its own permission rules; refusing the
+  // name only meant a model that followed the description got rejected and
+  // burned a retry. The prompt injection is not a security boundary, and `/generate`
+  // having no tool channel is.
   agent: ["Task"],
 };
 
@@ -1661,6 +1667,9 @@ class DeferredSSE {
 }
 
 async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
+  // Measured once by the caller, so the streaming and non-streaming paths report
+  // the same input_tokens instead of two different truths.
+  const promptTokens = prebuilt ? transcriptTokens(prebuilt) : 0;
   const transcript = prebuilt ?? buildTranscript(body);
   const tools = Array.isArray(body.tools) ? body.tools : [];
   const allowed = tools.map((t) => t.name);
@@ -1668,7 +1677,10 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
   const { level: effortLevel, source: effortSource } = resolveEffort(body, ctx);
 
   const started = Date.now();
-  const requestId = newId("req");
+  // Reuse the id the handler stamped, so `start`, `done` and any `error` for the
+  // same turn carry one identifier. Two ids for one turn make the log unjoinable
+  // exactly when you need to follow it.
+  const requestId = ctx.requestId || newId("req");
 
   // Are we inside a tool loop the model itself started? The last user message is
   // nothing but tool_result blocks in that case, and only the model can put it
@@ -1739,7 +1751,12 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
 
       let res;
       try {
-        res = await runModel(transcript + RETRY_HINTS[attempt] + retryNote, {
+        // One correction at a time. Sending both the generic hint for this attempt AND
+      // the specific one means the model is told "your previous reply came back
+      // EMPTY" when the bridge never received a reply at all - which is exactly
+      // what happens when attempt 0 failed upstream. It then hunts for a
+      // discarded native tool call that never existed.
+      res = await runModel(transcript + (retryNote || RETRY_HINTS[attempt]), {
           effortLevel,
           maxTokens: 0, // the ceiling is applied after parsing, never before
           signal: turnSignal,
@@ -2002,7 +2019,14 @@ async function handleMessages(body, sse, ctx = {}, prebuilt, opts = {}) {
     );
     usage = {
       ...usage,
-      input: tokensSpent,
+      // input_tokens means "how big was this prompt", which is what Claude Code
+      // accumulates for its context budget. `tokensSpent` means something else -
+      // the sum across every retry - and reporting it here made the same turn
+      // report two different figures depending on whether the client streamed,
+      // because the streaming path is forced to answer from the preflight before
+      // it knows the attempt count. Cost accounting belongs in the log, where
+      // it already is.
+      input: promptTokens || Math.ceil(actualChars / CHARS_PER_TOKEN) || usage.input,
       // Clamped to what was actually sent AND to the ceiling the caller asked
       // for. Measuring a 50 000-character Write against CHARS_PER_TOKEN while
       // the budget used OUT_CHARS_PER_TOKEN reported 17 880 output tokens for
@@ -2144,9 +2168,15 @@ function sendError(res, err) {
   // The log keeps the original cause. The client gets the sanitized text, but an
   // operator reading bridge.log needs to see what actually broke - "internal
   // bridge error" with no cause is useless for diagnosis.
+  //
+  // The request id matters most on the errors you can least reproduce. Without
+  // it a `tool_choice` turn appeared in the log as a `start` line and then
+  // nothing, unattached to any error, and those were exactly the turns worth
+  // investigating.
   logRequest("error", {
     status: e.status,
     type: e.type,
+    id: res[REQUEST_ID] || undefined,
     message: e.message.slice(0, 200),
     cause: String(err?.stack?.split("\n").slice(0, 3).join(" | ") || err).slice(0, 400),
   });
@@ -2309,6 +2339,10 @@ async function handle(req, res) {
   // Stop paying for an answer nobody will read.
   const ac = new AbortController();
   ctx.signal = ac.signal;
+  // Stamped here so any later sendError - including one thrown deep in the
+  // retry loop - can name the turn it belongs to in the log.
+  res[REQUEST_ID] = newId("req");
+  ctx.requestId = res[REQUEST_ID];
   const onClose = () => {
     if (!res.writableEnded) ac.abort();
   };
