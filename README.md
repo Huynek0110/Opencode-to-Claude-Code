@@ -223,17 +223,26 @@ ngược lại — *"Provide extremely detailed descriptions… Aim for at least
 tool description"*, và gọi bản mô tả ngắn là ví dụ **xấu**.
 
 **Đo hành vi model đừng dùng `claude -p`.** Một lượt Claude Code tốn ~32 000 input token trước
-khi model làm bất cứ việc gì, vì 23 tool schema cộng system prompt. `probe-behaviour.mjs` gửi
-3 tool và prompt một dòng — khoảng 1/20 chi phí:
+khi model làm bất cứ việc gì, vì 23 tool schema cộng system prompt.
+
+`probe-toolcall.mjs` là phép đo chuẩn cho câu hỏi *"model có dùng được tool call không"* —
+3 tool, prompt một dòng, ~1 500 token cho 4 case:
 
 ```powershell
-node probe-behaviour.mjs        # 4 case
-node probe-behaviour.mjs 5      # lặp 5 vòng để đo tỉ lệ
+node probe-toolcall.mjs          # 4 case, một vòng
+node probe-toolcall.mjs 5        # năm vòng, để ra tỉ lệ
 ```
 
-Nó **báo cáo, không assert**: một model free được phép hành xử khác nhau giữa những ngày khác
-nhau, và suite fail vì lý do đó dạy bạn phớt lờ suite. Dùng `test-mock.mjs` cho contract, dùng
-probe này cho xu hướng.
+Cùng bốn case đó qua `claude -p` sẽ tốn ~128 000 token. Bộ tool của Claude Code còn là chính
+bộ tool đang được mô phỏng, nên một lỗi ở đó không nói lên gì về việc lớp mô phỏng có chạy
+đúng hay không.
+
+`probe-behaviour.mjs` là biến thể rộng hơn (gồm cả case giữa vòng lặp tool), dùng khi muốn
+nhìn hành vi chứ không chỉ pass/fail.
+
+Cả hai **báo cáo, không assert**: một model free được phép khác nhau giữa những ngày khác nhau,
+và suite fail vì lý do đó chỉ dạy bạn phớt lờ suite. Dùng `test-mock.mjs` cho contract — nó
+0 token và **không bao giờ** cần model.
 
 ---
 
@@ -558,7 +567,8 @@ khi debug cục bộ. Nguyên nhân gốc của mọi lỗi 500 vẫn được g
 | `test-unit.mjs` | Hàm thuần: parse, tool, transcript, effort — không cần mạng |
 | `test-http.mjs` | Lớp HTTP + `DeferredSSE`, không cần mạng — bắt lỗi status/streaming |
 | `test-mock.mjs` | Contract end-to-end với `opencode serve` giả — **miễn phí**, deterministic |
-| `probe-behaviour.mjs` | Đo hành vi model thật, **rẻ** (3 tool, ~1.2k token/turn). Báo cáo, không assert |
+| `probe-toolcall.mjs` | **Phép đo chuẩn**: model có dùng được tool call không. 3 tool, ~1.5k token/4 case |
+| `probe-behaviour.mjs` | Đo hành vi rộng hơn, **rẻ**. Báo cáo, không assert |
 | `test-sse.mjs` | Hợp đồng streaming end-to-end *(live)* |
 | `test-effort.mjs` | Effort end-to-end *(live)* |
 | `test-protocol.mjs` | 4 case dễ lỗi protocol *(live)* |
