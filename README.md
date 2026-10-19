@@ -338,6 +338,30 @@ khớp không phân biệt hoa thường **đứng trước** bảng alias, `web
 
 ---
 
+## Tại sao bridge còn phải vòng vèo, và cái giá đã được đo
+
+Anthropic không có tài liệu cho "prompt-based tool calling" — đây là đường vòo. Nhưng cái
+giá của nó **đã đo được trong chính nghiên cứu**, và nó không nói "viết JSON cẩn thận hơn":
+
+| Nghiên cứu | Kết quả |
+|---|---|
+| **Instruction Stacking Collapse** (arXiv 2608.02639) | Sonnet 4.6 tụt **.964 → .604** khi ràng buộc đi từ 1 lên 20. GPT-5-mini → **.200**. Thiệt hại tập trung ở **ràng buộc thứ 5–8**. |
+| **"Let Me Speak Freely?"** (2408.02442) | Thêm tool schema vào prompt làm Claude-3-Haiku trên GSM8K rơi **86,99 (sd 0,2) → 23,44 (sd 22,9)**. |
+| — cùng nghiên cứu đó | Lỗi **parse chỉ 0,148%** nhưng vẫn hụt 38 điểm. `extractJson` giỏi hơn **không** chữa được. |
+| **IFScale** (2507.11538) | Model nhỏ **bỏ rơi** ràng buộc nhiều hơn là làm sai: omission 34,88 so với modification. |
+| **Order Matters** (2502.17204) | Thứ tự "khó → dễ" thắng, lệch ~7%. Nghiên cứu này **không có Claude nào**. |
+
+Hai điều đó khớp **chính xác** với log của bridge:
+
+- Triệu chứng là **không gọi tool**, không phải gọi sai. Đó là omission, không phải modification.
+- Protocol của bridge dài ~960 token cố định mỗi lượt, cộng 23–26 schema — rơi thẳng vào vùng
+  ràng buộc 5–8.
+
+**Hệ quả thẳng cho thiết kế:** đừng thêm quy tắc. Cắt chúng. Và đừng kỳ vọng parser giỏi hơn
+cứu được — lỗi parse vốn không phải nguyên nhân.
+
+---
+
 ## "Nói thay vì làm" — kiểu chết tệ nhất
 
 Model đôi khi viết *"Okay, continuing to read the rest of bridge.mjs, and kicking off research in
