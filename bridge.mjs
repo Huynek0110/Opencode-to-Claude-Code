@@ -812,7 +812,7 @@ function renderToolResult(content) {
       // content disappear without trace, which is silent data loss rather than
       // an honest "this block cannot be rendered".
       if (p.type === "image") return "[image omitted]";
-      const json = safeJson(p);
+      const json = escapeFence(safeJson(p));
       return json.length > 400 ? `[${p.type}] ` + json.slice(0, 400) + " ..." : `[${p.type}] ${json}`;
     })
     .join("\n")
